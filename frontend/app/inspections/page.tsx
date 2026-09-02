@@ -1390,9 +1390,9 @@ export default function InspectionsPage() {
               </div>
             )}
             {s.internal_account_code && (
-              <div style={{ fontSize: 8, color: "#6b7280", marginBottom: 2 }}>
+              <div style={{ fontSize: 8, color: "#6b7280", marginBottom: 2 }} title="Internal account code">
                 <i className="fas fa-id-badge" style={{ width: 10, color: "#007890" }} />
-                <span style={{ fontWeight: 500 }}>{s.internal_account_code}</span>
+                <span style={{ fontWeight: 600 }}>Account: {s.internal_account_code}</span>
               </div>
             )}
 

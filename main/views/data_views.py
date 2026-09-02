@@ -1700,6 +1700,13 @@ def api_inspections(request):
             inspections = list(g.inspections.all())
             first_insp = inspections[0] if inspections else None
             insp_ids = [p.id for p in inspections]
+            # Older/manual groups can have the code missing on one child (or only
+            # on the linked client). Do not let the arbitrary first child hide a
+            # valid account code for the whole inspection group.
+            group_account_code = next(
+                (p.internal_account_code for p in inspections if p.internal_account_code),
+                (g.client.internal_account_code if g.client and g.client.internal_account_code else ''),
+            )
 
             # Group-level file flags — use ALL inspection IDs for the same client+date
             # so badges match the Files modal / expand view (which also searches by client+date)
@@ -1817,7 +1824,7 @@ def api_inspections(request):
                 'group_type': g.group_type or '',
                 'facility_type': g.facility_type or '',
                 'corporate_group': g.corporate_group or '',
-                'internal_account_code': first_insp.internal_account_code if first_insp and first_insp.internal_account_code else '',
+                'internal_account_code': group_account_code,
                 'registration_code': first_insp.registration_code if first_insp and first_insp.registration_code else '',
                 'physical_address': first_insp.physical_address if first_insp and first_insp.physical_address else '',
                 'telephone': first_insp.telephone if first_insp and first_insp.telephone else '',
@@ -5967,7 +5974,15 @@ def api_edit_inspection_group(request):
                         if commodity in explicitly_removed:
                             to_delete.extend(existing)
 
+                # SAFETY: never hard-delete an inspection that has attached
+                # documents (RFI / COA / compliance checklist / etc.). Deleting
+                # the inspection cascades to InspectionDocument (on_delete=CASCADE)
+                # and the attached checklist vanishes. If a removed commodity
+                # still has documents, keep the record instead of destroying them.
+                from ..models import InspectionDocument as _InspDoc
                 for rel in to_delete:
+                    if _InspDoc.objects.filter(inspection_id=rel.id).exists():
+                        continue  # has attached documents — do not delete
                     rel.delete()
 
                 for rel in to_update:

@@ -1452,8 +1452,15 @@ def edit_fsa_inspection(request, pk):
                         parent_group.save()
                         print(f"[EDIT FORM DEBUG] Updated parent InspectionGroup #{parent_group.id} with shared fields")
 
-                    # Delete inspections that are no longer needed
+                    # Delete inspections that are no longer needed — but NEVER
+                    # delete one that has attached documents (RFI / COA / compliance
+                    # checklist / etc.), since the delete cascades to
+                    # InspectionDocument and the attached checklist would be lost.
+                    from ..models import InspectionDocument as _InspDoc
                     for rel_insp in inspections_to_delete:
+                        if _InspDoc.objects.filter(inspection_id=rel_insp.id).exists():
+                            print(f"[EDIT FORM DEBUG] KEEPING inspection {rel_insp.id} ({rel_insp.commodity}) — has attached documents")
+                            continue
                         print(f"[EDIT FORM DEBUG] Deleting inspection {rel_insp.id} ({rel_insp.commodity})")
                         rel_insp.delete()
 
