@@ -67,6 +67,18 @@ export interface KpiCommodityRow {
   commodities: { commodity: string; target: number; done: number; pct: number | null }[];
   total_target: number; total_done: number; total_pct: number | null;
 }
+export interface FinanceStage {
+  avg: number | null; median: number | null; count: number;
+  prev_avg: number | null; prev_count: number; target: number | null; label: string;
+}
+export interface FinanceEfficiency {
+  timeliness: { approval: FinanceStage; send_docs: FinanceStage; invoice: FinanceStage; sample_to_coa: FinanceStage };
+  speed_to_cash: FinanceStage;
+  invoiced_week: { rand: number; jobs: number };
+  invoiced_prev: { rand: number; jobs: number };
+  unbilled: { rand: number; jobs: number; aged_rand: number; aged_jobs: number };
+  rates: { hour: number; km: number; sample: number };
+}
 export interface TravelRow {
   inspector_name: string; km: number; hours: number; inspections: number;
   avg_km_per_inspection: number; new_facilities: number; rank: number;
@@ -143,6 +155,7 @@ export interface ReportResponse {
   roster?: string[];
   monthly_financials?: MonthlyFinancials;
   monthly_financials_series?: MonthlyFinancials[];
+  finance_efficiency?: FinanceEfficiency;
   travel: TravelRow[];
   error?: string;
 }
@@ -1685,6 +1698,52 @@ export async function buildManagerReportPdf(data: ReportResponse, logo: string |
   doc.setFont("helvetica", "normal"); doc.setTextColor(...DARK);
   y += 9;
 
+  /* ══ HOW FAST EACH STAGE CLEARS — the four back-office turnaround stages
+     (from the web Timelines tab) as clean cards: typical (median) days, with
+     average, target and week-on-week trend, tagged with the team that owns each
+     step. This is the cross-team timeliness view — a manager metric. ══ */
+  const feM = data.finance_efficiency;
+  if (feM) {
+    if (y > 215) { doc.addPage(); y = 16; }
+    doc.setFont("helvetica", "bold"); doc.setFontSize(12); doc.setTextColor(...DARK);
+    doc.text("How fast each stage clears", ML, y);
+    doc.setDrawColor(...TEAL); doc.setLineWidth(0.6); doc.line(ML, y + 2.2, ML + 58, y + 2.2);
+    y += 8;
+    const tstages = [
+      { key: "approval" as const, name: "Approval", who: "Inspector" },
+      { key: "send_docs" as const, name: "Send documents", who: "Office" },
+      { key: "invoice" as const, name: "Invoice", who: "Finance" },
+      { key: "sample_to_coa" as const, name: "Sample to COA", who: "Lab" },
+    ];
+    const gT = 5, cwT = (CW - 3 * gT) / 4, chT = 30;
+    tstages.forEach((s, i) => {
+      const t = feM.timeliness[s.key];
+      const x = ML + i * (cwT + gT);
+      const med = t.median;
+      const col: [number, number, number] = (med != null && t.target != null)
+        ? (med <= t.target ? GREEN : med <= t.target + 3 ? AMBER : RED) : GRAY;
+      doc.setFillColor(246, 248, 250); doc.roundedRect(x, y, cwT, chT, 2, 2, "F");
+      doc.setFillColor(...col); doc.rect(x, y, cwT, 2.2, "F");
+      doc.setFont("helvetica", "bold"); doc.setFontSize(7.6); doc.setTextColor(...DARK);
+      doc.text(s.name, x + cwT / 2, y + 7, { align: "center" });
+      doc.setFont("helvetica", "normal"); doc.setFontSize(6.2); doc.setTextColor(...GRAY);
+      doc.text(s.who, x + cwT / 2, y + 10.8, { align: "center" });
+      doc.setFont("helvetica", "bold"); doc.setFontSize(17); doc.setTextColor(...col);
+      doc.text(med != null ? String(med) : "—", x + cwT / 2, y + 19.5, { align: "center" });
+      doc.setFont("helvetica", "normal"); doc.setFontSize(6); doc.setTextColor(...GRAY);
+      doc.text("days (typical)", x + cwT / 2, y + 23, { align: "center" });
+      const trend = (t.prev_avg != null && t.avg != null) ? (t.avg < t.prev_avg ? "improving" : t.avg > t.prev_avg ? "slower" : "flat") : "";
+      const trendCol: [number, number, number] = trend === "improving" ? GREEN : trend === "slower" ? RED : GRAY;
+      doc.setFontSize(5.8); doc.setTextColor(...GRAY);
+      doc.text(`avg ${t.avg != null ? t.avg : "—"}d${t.target != null ? ` · target ${t.target}d` : ""}`, x + cwT / 2, y + 26.6, { align: "center" });
+      if (trend) { doc.setFont("helvetica", "bold"); doc.setFontSize(6); doc.setTextColor(...trendCol); doc.text(trend, x + cwT / 2, y + 29.2, { align: "center" }); }
+    });
+    y += chT + 4;
+    doc.setFont("helvetica", "italic"); doc.setFontSize(6.8); doc.setTextColor(...GRAY);
+    doc.text('Typical = median days from inspection to that step, for jobs that cleared it this week. Green = at or under target, amber = close, red = over. Trend is vs last week.', ML, y, { maxWidth: CW });
+    doc.setFont("helvetica", "normal"); doc.setTextColor(...DARK); y += 8;
+  }
+
   /* ══ 2. TEAM PROGRESS — one table, one header. Per inspector: how many
      inspections last week / this week / this month, split into normal vs
      occurrence reports, and how many are approved vs still waiting. ══ */
@@ -2278,13 +2337,18 @@ export async function buildFinanceReportPdf(data: ReportResponse, logo: string |
   doc.text(`Reporting period: ${periodLabel}`, W / 2, lb + 27, { align: "center" });
   doc.setFontSize(10); doc.text(data.quarter, W / 2, lb + 34, { align: "center" });
   doc.setFontSize(9); doc.setTextColor(...GRAY);
-  doc.text("Invoicing and documents sent — volume, speed and trend.", W / 2, lb + 43, { align: "center" });
+  doc.text("Invoicing, profitability and money owed — the financial health of the APS department.", W / 2, lb + 43, { align: "center" });
   doc.setFontSize(9); doc.setTextColor(...TEAL);
-  doc.text("IN THIS REPORT", W / 2, lb + 58, { align: "center" });
-  doc.setFontSize(9.5); doc.setTextColor(...GRAY_LIGHT);
-  ["The Week at a Glance", "Action Points", "1. Unbilled Invoices — Act On These", "2. Invoicing & Documents", "3. Invoices Done vs Needed", "4. Who's Doing the Work", "5. Commodities Inspected"]
-    .forEach((s, i) => doc.text(s, W / 2, lb + 66 + i * 7, { align: "center" }));
-  doc.setFontSize(8); doc.text("CONFIDENTIAL — For the finance team", W / 2, H - 42, { align: "center" });
+  doc.text("IN THIS REPORT", W / 2, lb + 56, { align: "center" });
+  doc.setFontSize(9); doc.setTextColor(...GRAY_LIGHT);
+  ["The Week at a Glance", "Profitability — Revenue vs Cost",
+   "Action Points", "Unbilled Invoices — Act On These", "Invoicing & Documents Each Month",
+   "Invoices Done vs Needed", "Who's Doing the Work  ·  Commodities"]
+    .forEach((s, i) => doc.text(s, W / 2, lb + 63 + i * 6.4, { align: "center" }));
+  doc.setFontSize(8); doc.setTextColor(...GRAY);
+  doc.text("DRAFT for review — tell me what to remove.", W / 2, H - 48, { align: "center" });
+  doc.setFontSize(8); doc.setTextColor(...GRAY_LIGHT);
+  doc.text("CONFIDENTIAL — Management only (contains revenue)", W / 2, H - 42, { align: "center" });
 
   /* ══ PAGE 2: THE WEEK AT A GLANCE ══ */
   doc.addPage();
@@ -2318,8 +2382,80 @@ export async function buildFinanceReportPdf(data: ReportResponse, logo: string |
   }
   y += cardH + 12;
   doc.setFont("helvetica", "normal"); doc.setFontSize(7.5); doc.setTextColor(...GRAY);
-  doc.text("Note: invoice values (rand amounts) are not available in the system yet — this report covers volume, speed and trend. Corporate-store jobs are handled centrally and excluded.", ML, y, { maxWidth: CW });
+  doc.text("Rand values are estimated from billable hours, kilometres and samples at the standard rates (the same basis as the Revenue Per Inspector page). Corporate-store jobs are handled centrally and excluded.", ML, y, { maxWidth: CW });
   doc.setTextColor(...DARK); y += 10;
+
+  // Rand formatter, reused by the Profitability section below.
+  const rand = (n: number) => "R" + Math.round(n).toLocaleString("en-ZA");
+
+  /* NOTE: the cross-team Timeliness scorecard (Approval/Inspector, Send docs/
+     Office, Sample→COA/Lab) and the "Where It's Stuck & Who Owns It" backlog
+     live in the MANAGER report — they span every team, not just finance. The
+     finance report keeps only financial content (Speed to Cash, invoicing,
+     profitability, unbilled). */
+
+  /* ══ PROFITABILITY — revenue, cost and profit for the department this month
+     and the trend across recent months. ══ */
+  const mseriesNewest = data.monthly_financials_series ?? [];
+  // Use the last COMPLETE month for the headline — a partial month compares part-
+  // month revenue against a full month of salary, which reads as a false loss.
+  const mf = mseriesNewest.find(m => !m.partial) ?? data.monthly_financials;
+  const mseries = mseriesNewest.slice().reverse(); // oldest -> newest
+  if (mf) {
+    if (y > 205) { doc.addPage(); y = 16; }
+    header("Profitability — Revenue vs Cost");
+    intro(`Department revenue (billable hours, kilometres and samples at standard rates) against cost (salaries + 20% management fee) for ${mf.month_label ?? "the month"} — the last complete month. Profit is revenue minus cost; margin is profit as a share of revenue. The current month is still building, so its profit is only meaningful once the month closes.`);
+    const margin = mf.total_revenue > 0 ? Math.round(mf.total_profit * 100 / mf.total_revenue) : 0;
+    const g4 = 5, cw4 = (CW - 3 * g4) / 4, ch4 = 26;
+    const cards: [string, string, [number, number, number]][] = [
+      ["Revenue", rand(mf.total_revenue), TEAL],
+      ["Cost", rand(mf.total_cost), GRAY],
+      ["Profit", rand(mf.total_profit), mf.total_profit >= 0 ? GREEN : RED],
+      ["Margin", `${margin}%`, margin >= 25 ? GREEN : margin >= 0 ? AMBER : RED],
+    ];
+    cards.forEach((c, i) => {
+      const x = ML + i * (cw4 + g4);
+      doc.setFillColor(246, 248, 250); doc.roundedRect(x, y, cw4, ch4, 2, 2, "F");
+      doc.setFillColor(...c[2]); doc.rect(x, y, cw4, 2.4, "F");
+      doc.setFont("helvetica", "bold"); doc.setFontSize(13); doc.setTextColor(...c[2]);
+      doc.text(c[1], x + cw4 / 2, y + 13, { align: "center" });
+      doc.setFont("helvetica", "normal"); doc.setFontSize(7.5); doc.setTextColor(...GRAY);
+      doc.text(c[0].toUpperCase(), x + cw4 / 2, y + 20, { align: "center" });
+    });
+    y += ch4 + 8;
+
+    if (mseries.length > 1) {
+      if (y > 230) { doc.addPage(); y = 16; }
+      doc.setFont("helvetica", "bold"); doc.setFontSize(10); doc.setTextColor(...DARK);
+      doc.text("Month by month", ML, y + 2); y += 6;
+      autoTable(doc, {
+        startY: y,
+        head: [["Month", "Revenue", "Cost", "Profit", "Margin"]],
+        body: mseries.map(m => {
+          const mg = m.total_revenue > 0 ? Math.round(m.total_profit * 100 / m.total_revenue) : 0;
+          // Partial month: revenue is real, but profit/margin vs a full month's
+          // salary would read as a false loss — show them as "building".
+          return [(m.month_label ?? "") + (m.partial ? " (so far)" : ""), rand(m.total_revenue), rand(m.total_cost),
+            m.partial ? "building" : rand(m.total_profit), m.partial ? "—" : `${mg}%`];
+        }),
+        theme: "grid",
+        styles: { fontSize: 8.5, cellPadding: 2.6, valign: "middle", lineColor: [226, 232, 240], textColor: DARK },
+        headStyles: { fillColor: TEAL, textColor: WHITE, fontStyle: "bold", fontSize: 8.5 },
+        alternateRowStyles: { fillColor: [248, 250, 252] },
+        columnStyles: { 0: { fontStyle: "bold" }, 1: { halign: "right" }, 2: { halign: "right" }, 3: { halign: "right", fontStyle: "bold" }, 4: { halign: "right" } },
+        margin: { left: ML, right: MR },
+        didParseCell: (d: any) => {
+          if (d.section === "body" && (d.column.index === 3 || d.column.index === 4)) {
+            const m = mseries[d.row.index];
+            if (m.partial) { d.cell.styles.textColor = GRAY; d.cell.styles.fontStyle = "italic"; }
+            else if (m.total_profit < 0) d.cell.styles.textColor = RED;
+            else if (d.column.index === 3) d.cell.styles.textColor = GREEN;
+          }
+        },
+      });
+      y = (doc as any).lastAutoTable.finalY + 10;
+    }
+  }
 
   /* ══ ACTION POINTS — what the finance manager should do this week, generated
      straight from the numbers. Red = urgent, amber = attention. ══ */

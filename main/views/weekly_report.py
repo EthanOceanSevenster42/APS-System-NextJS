@@ -561,6 +561,121 @@ def _month_financials_series(anchor_end, excl, n=6):
     return out
 
 
+# Finance/efficiency report stage targets (days). Unlike the manager report
+# (where invoice has no agreed target), Speed to Cash needs a yardstick, so each
+# stage gets a starting target the APS department can tune later.
+FINANCE_STAGE_TARGETS = {'approval': 2, 'send_docs': 3, 'invoice': 7, 'sample_to_coa': 7}
+FINANCE_STAGE_LABELS = {
+    'approval': 'Inspection to approval',
+    'send_docs': 'Inspection to documents sent',
+    'invoice': 'Inspection to invoice (speed to cash)',
+    'sample_to_coa': 'Sample to COA received',
+}
+
+
+def _finance_efficiency(week_start, week_end, prev_start, prev_end):
+    """Efficiency + money view for the finance report. Measures the four back-
+    office turnaround stages by WHEN THEY WERE COMPLETED in the week (matching
+    the Analytics 'Timelines' tab), the Rand invoiced this week, and the Rand
+    still sitting uninvoiced. MANAGEMENT-ONLY (reads revenue)."""
+    fee = {f.fee_code: float(f.rate) for f in InspectionFee.objects.all()}
+    hour_rate = fee.get('inspection_hour_rate', 540.60)
+    km_rate = fee.get('inspection_km_rate', fee.get('travel_rate_per_km', 6.50))
+    sample_rate = fee.get('sample_collection', 0)
+    corp = Q(inspection_group__group_type='Corporate Store')
+
+    # Four turnaround stages, measured by completion date falling in [a, b] — i.e.
+    # what the office/finance/lab actually cleared that week, and how fast, from
+    # the inspection date. Same deltas as the Analytics 'Timelines' tab.
+    _STAGES = {
+        'approval':      ('approved_date',         {'approved_status': 'APPROVED'}),
+        'send_docs':     ('sent_date',             {'is_sent': True}),
+        'invoice':       ('invoice_uploaded_date', {}),
+        'sample_to_coa': ('coa_uploaded_date',     {'is_sample_taken': True}),
+    }
+
+    def _stage(field, extra, a, b):
+        flt = {f'{field}__date__gte': a, f'{field}__date__lte': b, **extra}
+        days = []
+        for r in (FoodSafetyAgencyInspection.objects.filter(**flt)
+                  .exclude(corp).exclude(date_of_inspection__isnull=True)
+                  .values('date_of_inspection', field)):
+            comp = r[field]
+            comp = comp.date() if isinstance(comp, datetime.datetime) else comp
+            d = (comp - r['date_of_inspection']).days
+            if d >= 0:
+                days.append(d)
+        days.sort()
+        n = len(days)
+        return {'avg': round(sum(days) / n, 1) if n else None,
+                'median': days[n // 2] if n else None, 'count': n}
+
+    timeliness = {}
+    for key, (field, extra) in _STAGES.items():
+        cur = _stage(field, extra, week_start, week_end)
+        prev = _stage(field, extra, prev_start, prev_end)
+        timeliness[key] = {
+            **cur, 'prev_avg': prev['avg'], 'prev_count': prev['count'],
+            'target': FINANCE_STAGE_TARGETS[key], 'label': FINANCE_STAGE_LABELS[key],
+        }
+
+    # Rand invoiced this week vs last — revenue of the jobs invoiced in the week.
+    def _revenue_invoiced(a, b):
+        gids = set(FoodSafetyAgencyInspection.objects
+                   .filter(invoice_uploaded_date__date__gte=a, invoice_uploaded_date__date__lte=b)
+                   .exclude(corp).values_list('inspection_group_id', flat=True))
+        gids.discard(None)
+        if not gids:
+            return {'rand': 0.0, 'jobs': 0}
+        hk = InspectionGroup.objects.filter(id__in=gids).aggregate(h=Sum('hours'), k=Sum('km_traveled'))
+        s = FoodSafetyAgencyInspection.objects.filter(inspection_group_id__in=gids, is_sample_taken=True).count()
+        rand = float(hk['h'] or 0) * hour_rate + float(hk['k'] or 0) * km_rate + s * sample_rate
+        return {'rand': round(rand, 2), 'jobs': len(gids)}
+
+    # Rand still uninvoiced: RAW/PMP jobs sent but not invoiced (same definition
+    # as billing_backlog), plus the slice older than 14 days.
+    from django.db.models import Exists as _Ex, OuterRef as _OR, Min as _Min
+    _today = datetime.date.today()
+    bl = list(InspectionGroup.objects.exclude(group_type='Corporate Store')
+              .filter(_Ex(FoodSafetyAgencyInspection.objects.filter(
+                  inspection_group_id=_OR('pk'), commodity__in=['RAW', 'PMP'])))
+              .filter(_Ex(FoodSafetyAgencyInspection.objects.filter(
+                  inspection_group_id=_OR('pk'), sent_date__isnull=False)))
+              .exclude(_Ex(FoodSafetyAgencyInspection.objects.filter(
+                  inspection_group_id=_OR('pk'), invoice_uploaded_date__isnull=False)))
+              .annotate(insp=_Min('inspections__date_of_inspection'))
+              .values('id', 'hours', 'km_traveled', 'insp'))
+    bl_gids = [r['id'] for r in bl]
+    samples_by_group = {}
+    if bl_gids:
+        for r in (FoodSafetyAgencyInspection.objects
+                  .filter(inspection_group_id__in=bl_gids, is_sample_taken=True)
+                  .values('inspection_group_id').annotate(n=Count('id'))):
+            samples_by_group[r['inspection_group_id']] = r['n']
+    unbilled_rand = unbilled_aged_rand = 0.0
+    unbilled_aged_jobs = 0
+    for r in bl:
+        rev = (float(r['hours'] or 0) * hour_rate + float(r['km_traveled'] or 0) * km_rate
+               + samples_by_group.get(r['id'], 0) * sample_rate)
+        unbilled_rand += rev
+        age = (_today - r['insp']).days if r['insp'] else None
+        if age is not None and age > 14:
+            unbilled_aged_rand += rev
+            unbilled_aged_jobs += 1
+
+    return {
+        'timeliness': timeliness,
+        'speed_to_cash': timeliness['invoice'],
+        'invoiced_week': _revenue_invoiced(week_start, week_end),
+        'invoiced_prev': _revenue_invoiced(prev_start, prev_end),
+        'unbilled': {
+            'rand': round(unbilled_rand, 2), 'jobs': len(bl),
+            'aged_rand': round(unbilled_aged_rand, 2), 'aged_jobs': unbilled_aged_jobs,
+        },
+        'rates': {'hour': hour_rate, 'km': km_rate, 'sample': sample_rate},
+    }
+
+
 def _monday(d):
     return d - datetime.timedelta(days=d.weekday())
 
@@ -1282,5 +1397,8 @@ def api_weekly_report(request):
         # newest month alone (used by the glance KPI + Standing Out highlights).
         'monthly_financials': _fin_series[0] if _fin_series else None,
         'monthly_financials_series': _fin_series,
+        # Finance/efficiency report: Speed to Cash headline, timeliness scorecard,
+        # Rand invoiced this week, and Rand still uninvoiced. MANAGEMENT-ONLY.
+        'finance_efficiency': _finance_efficiency(week_start, week_end, prev_start, prev_end),
         'travel': travel,
     })
