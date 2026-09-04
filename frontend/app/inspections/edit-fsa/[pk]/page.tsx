@@ -192,6 +192,10 @@ export default function EditInspectionPage() {
   const [groupType, setGroupType] = useState("");
   const [facilityType, setFacilityType] = useState("");
   const [commodities, setCommodities] = useState<Record<CommodityKey, number>>({ POULTRY: 0, RAW: 0, PMP: 0, EGGS: 0 });
+  // Commodity counts as originally loaded from the DB. Used to warn before
+  // removing a commodity that already has saved records/documents, and to tell
+  // the backend which commodities the user deliberately removed.
+  const [originalCommodities, setOriginalCommodities] = useState<Record<CommodityKey, number>>({ POULTRY: 0, RAW: 0, PMP: 0, EGGS: 0 });
 
   // Step 2 fields (products)
   const [products, setProducts] = useState<ProductEntry[]>([]);
@@ -209,6 +213,26 @@ export default function EditInspectionPage() {
   const [step1Error, setStep1Error] = useState<string[]>([]);
   const [step2Error, setStep2Error] = useState<string[]>([]);
   const [step3Error, setStep3Error] = useState<string[]>([]);
+
+  /* ---- Confirm dialog (replaces the browser's native window.confirm) ---- */
+  const [confirmDialog, setConfirmDialog] = useState<{
+    title: string;
+    body: string;
+    detail?: string;
+    confirmLabel: string;
+    onConfirm: () => void;
+  } | null>(null);
+  const confirmCancelRef = useRef<HTMLButtonElement>(null);
+
+  // Focus Cancel (the safe choice) and let Escape dismiss, the way the native
+  // dialog behaved.
+  useEffect(() => {
+    if (!confirmDialog) return;
+    confirmCancelRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setConfirmDialog(null); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [confirmDialog]);
 
   /* ---- Load data ---- */
   useEffect(() => {
@@ -248,6 +272,7 @@ export default function EditInspectionPage() {
           if (p.commodity in counts) counts[p.commodity as CommodityKey]++;
         });
         setCommodities(counts);
+        setOriginalCommodities({ ...counts });
 
         setOptions({
           clients: f.clients || [],
@@ -294,7 +319,29 @@ export default function EditInspectionPage() {
   };
 
   const adjustCommodity = (key: CommodityKey, delta: number) => {
-    setCommodities(prev => ({ ...prev, [key]: Math.max(0, prev[key] + delta) }));
+    const label = COMMODITY_CONFIG.find(c => c.key === key)?.label || key;
+    const current = commodities[key];
+    const next = Math.max(0, current + delta);
+    // Removing a commodity that is already SAVED deletes that commodity's
+    // inspection record and every file attached to it (RFI, COA, compliance,
+    // lab results...). That is irreversible, so make the user confirm first.
+    const apply = () => setCommodities(prev => ({ ...prev, [key]: Math.max(0, prev[key] + delta) }));
+    if (delta < 0 && next < originalCommodities[key]) {
+      const removingAll = next === 0;
+      const losing = current - next;
+      setConfirmDialog({
+        title: removingAll ? `Remove ${label}?` : `Reduce ${label} to ${next}?`,
+        body: removingAll
+          ? `This permanently deletes the ${label} inspection record and every file attached to it.`
+          : `This permanently deletes ${losing} ${label} ${losing === 1 ? "entry" : "entries"} `
+            + `and every file attached to ${losing === 1 ? "it" : "them"}.`,
+        detail: "COA / lab results, Lab Form, Composition, Compliance, Retest, Other",
+        confirmLabel: removingAll ? `Remove ${label}` : "Reduce",
+        onConfirm: apply,
+      });
+      return;   // the dialog applies the change if the user confirms
+    }
+    apply();
   };
 
   /* ---- Navigation ---- */
@@ -352,6 +399,11 @@ export default function EditInspectionPage() {
     console.log(`[EditPage] SAVE clicked — clientName="${clientName}", town="${town}", corporateGroup="${corporateGroup}", groupType="${groupType}", facilityType="${facilityType}"`);
     setSubmitting(true);
     try {
+      // Commodities the user deliberately removed (confirmed via the warning in
+      // adjustCommodity). Only these get deleted server-side — anything simply
+      // absent from `products` is left alone, so nothing is lost by accident.
+      const removedCommodities = (Object.keys(originalCommodities) as CommodityKey[])
+        .filter(k => originalCommodities[k] > 0 && commodities[k] === 0);
       const payload = {
           inspection_id: Number(pk),
           client_name: clientName,
@@ -367,6 +419,9 @@ export default function EditInspectionPage() {
           travel_start_time: travelStart,
           travel_end_time: travelEnd,
           products: isOccurrence ? [] : products,
+          removed_commodities: removedCommodities,
+          // The user was warned that removing a commodity deletes its files.
+          confirm_delete_files: removedCommodities.length > 0,
       };
       console.log(`[EditPage] SAVE payload:`, JSON.stringify(payload, null, 2));
       const res = await fetch("/api/edit-inspection-group/", {
@@ -916,6 +971,46 @@ export default function EditInspectionPage() {
         </div>
 
       </div>{/* end max-w-3xl */}
+
+      {/* Confirm dialog — styled replacement for window.confirm */}
+      {confirmDialog && (
+        <div
+          className="confirm-overlay"
+          onClick={e => { if (e.target === e.currentTarget) setConfirmDialog(null); }}
+        >
+          <div className="confirm-card" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
+            <div className="confirm-icon"><i className="fas fa-triangle-exclamation" /></div>
+            <h3 className="confirm-title" id="confirm-title">{confirmDialog.title}</h3>
+            <p className="confirm-body">{confirmDialog.body}</p>
+            {confirmDialog.detail && (
+              <div className="confirm-detail">
+                <span className="confirm-detail-label">Files that will be deleted</span>
+                {confirmDialog.detail}
+              </div>
+            )}
+            <p className="confirm-warning">
+              <i className="fas fa-circle-exclamation" /> This cannot be undone.
+            </p>
+            <div className="confirm-actions">
+              <button
+                type="button"
+                className="btn btn-outline"
+                ref={confirmCancelRef}
+                onClick={() => setConfirmDialog(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-danger"
+                onClick={() => { const run = confirmDialog.onConfirm; setConfirmDialog(null); run(); }}
+              >
+                <i className="fas fa-trash-can" /> {confirmDialog.confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
@@ -1083,6 +1178,91 @@ const pageStyles = `
   .decrement-btn:disabled:hover { background: white; color: #ccc; }
   .commodity-count { font-size: 20px; font-weight: bold; color: #1f2937; min-width: 30px; text-align: center; }
 
+  /* Confirm dialog */
+  .confirm-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 11000;
+    background: rgba(15,23,42,0.55);
+    backdrop-filter: blur(4px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    animation: confirmFadeIn 0.15s ease;
+  }
+  .confirm-card {
+    background: white;
+    border-radius: 16px;
+    box-shadow: 0 25px 50px -12px rgba(0,0,0,0.45);
+    padding: 32px 32px 24px;
+    max-width: 460px;
+    width: 100%;
+    text-align: center;
+    animation: confirmPopIn 0.2s cubic-bezier(0.16,1,0.3,1);
+  }
+  .confirm-icon {
+    width: 64px; height: 64px;
+    margin: 0 auto 18px;
+    border-radius: 50%;
+    background: #fef2f2;
+    color: #dc2626;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 28px;
+  }
+  .confirm-title {
+    margin: 0 0 10px;
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: #1f2937;
+  }
+  .confirm-body {
+    margin: 0 0 16px;
+    font-size: 14px;
+    line-height: 1.6;
+    color: #4b5563;
+  }
+  .confirm-detail {
+    background: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: #6b7280;
+    text-align: left;
+  }
+  .confirm-detail-label {
+    display: block;
+    font-weight: 700;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #9ca3af;
+    margin-bottom: 4px;
+  }
+  .confirm-warning {
+    margin: 16px 0 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: #dc2626;
+    display: flex; align-items: center; justify-content: center; gap: 7px;
+  }
+  .confirm-actions {
+    display: flex;
+    gap: 12px;
+    margin-top: 24px;
+  }
+  .confirm-actions .btn { flex: 1; justify-content: center; white-space: nowrap; }
+  .btn-danger { background: #dc2626; color: white; }
+  .btn-danger:hover:not(:disabled) { background: #b91c1c; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(220,38,38,0.35); }
+  .btn-outline:focus-visible, .btn-danger:focus-visible { outline: 3px solid rgba(0,120,144,0.45); outline-offset: 2px; }
+  @keyframes confirmFadeIn { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes confirmPopIn {
+    from { opacity: 0; transform: translateY(12px) scale(0.96); }
+    to   { opacity: 1; transform: translateY(0) scale(1); }
+  }
+
   /* Client dropdown */
   .client-dropdown {
     position: absolute;
@@ -1194,6 +1374,12 @@ const pageStyles = `
     .checkbox-card.testing-card { padding-left: 40px; min-height: 42px; }
     .client-dropdown { max-height: 200px; }
     .client-dropdown-item { padding: 10px 12px; }
+  }
+  @media (max-width: 768px) {
+    .confirm-card { padding: 24px 20px 20px; border-radius: 12px; }
+    .confirm-icon { width: 54px; height: 54px; font-size: 24px; margin-bottom: 14px; }
+    .confirm-title { font-size: 1.1rem; }
+    .confirm-actions { flex-direction: column-reverse; gap: 10px; }
   }
   @media (max-width: 400px) {
     .max-w-3xl { padding: 0 4px; }

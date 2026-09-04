@@ -1766,3 +1766,79 @@ class WeeklyEmailLog(models.Model):
 
     def __str__(self):
         return f"{self.run_at:%Y-%m-%d %H:%M} {self.status} ({self.week_start})"
+
+
+class DeletedInspectionArchive(models.Model):
+    """Snapshot of every FoodSafetyAgencyInspection that gets deleted.
+
+    Written by a pre_delete signal, so it captures the record no matter which
+    code path removed it (the Next.js edit wizard, the legacy Django edit form,
+    the single-inspection delete views, or a whole-group delete).
+
+    Deleting an inspection cascades to InspectionDocument, so the attached
+    document rows are captured here too — otherwise the only record that a COA
+    or compliance checklist ever existed would vanish with it. The snapshot
+    holds every concrete field, which is enough to restore the row later.
+    """
+
+    # ---- identity of the deleted record -------------------------------
+    original_id          = models.PositiveIntegerField(db_index=True, help_text="Primary key the inspection had")
+    remote_id            = models.IntegerField(null=True, blank=True, db_index=True)
+    inspection_group_ref = models.PositiveIntegerField(
+        null=True, blank=True, db_index=True,
+        help_text="Group the inspection belonged to (plain int: survives the group being deleted too)",
+    )
+
+    # ---- denormalised for the list view (no joins, survives cascades) --
+    client_name        = models.CharField(max_length=200, blank=True, default='', db_index=True)
+    commodity          = models.CharField(max_length=50, blank=True, default='', db_index=True)
+    product_name       = models.CharField(max_length=200, blank=True, default='')
+    date_of_inspection = models.DateField(null=True, blank=True, db_index=True)
+    inspector_name     = models.CharField(max_length=100, blank=True, default='')
+
+    # ---- the payload ---------------------------------------------------
+    # {field_name: json-safe value} for every concrete field on the model
+    snapshot       = models.JSONField(default=dict)
+    # [{"document_type": "coa", "uploaded_by": "Ethan", "uploaded_date": "..."}]
+    documents      = models.JSONField(default=list)
+    document_count = models.PositiveIntegerField(default=0)
+
+    # ---- who / when / where -------------------------------------------
+    deleted_by = models.ForeignKey(
+        'auth.User', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='inspection_deletions',
+    )
+    deleted_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    source     = models.CharField(
+        max_length=200, blank=True, default='',
+        help_text="Request path the delete came from, e.g. /api/edit-inspection-group/",
+    )
+
+    # ---- restore tracking ----------------------------------------------
+    restored_at    = models.DateTimeField(null=True, blank=True)
+    restored_by    = models.ForeignKey(
+        'auth.User', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='inspection_restores',
+    )
+    restored_to_id = models.PositiveIntegerField(
+        null=True, blank=True, help_text="Primary key of the inspection recreated by the restore",
+    )
+
+    class Meta:
+        db_table = 'deleted_inspection_archive'
+        ordering = ['-deleted_at']
+        verbose_name = "Deleted Inspection Archive"
+        verbose_name_plural = "Deleted Inspection Archive"
+        indexes = [
+            models.Index(fields=['-deleted_at'],                name='idx_dia_date'),
+            models.Index(fields=['deleted_by', '-deleted_at'],  name='idx_dia_user_date'),
+            models.Index(fields=['client_name', '-deleted_at'], name='idx_dia_client_date'),
+            models.Index(fields=['original_id'],                name='idx_dia_original'),
+        ]
+
+    def __str__(self):
+        return f"{self.client_name} ({self.commodity}) deleted by {self.deleted_by} at {self.deleted_at}"
+
+    @property
+    def is_restored(self):
+        return self.restored_at is not None

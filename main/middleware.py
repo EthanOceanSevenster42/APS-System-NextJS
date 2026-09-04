@@ -19,6 +19,15 @@ def get_current_user():
     return getattr(_thread_locals, 'user', None)
 
 
+def get_current_path():
+    """Return the path of the current request, or None.
+
+    Audit signals record it so an archived deletion says which endpoint or page
+    the delete came from, not just who did it.
+    """
+    return getattr(_thread_locals, 'path', None)
+
+
 class CurrentUserMiddleware:
     """Store the current request user in thread-local so signals can access it."""
     def __init__(self, get_response):
@@ -26,10 +35,12 @@ class CurrentUserMiddleware:
 
     def __call__(self, request):
         _thread_locals.user = getattr(request, 'user', None)
+        _thread_locals.path = getattr(request, 'path', None)
         try:
             return self.get_response(request)
         finally:
             _thread_locals.user = None
+            _thread_locals.path = None
 
 
 class ApiAuthJsonMiddleware:

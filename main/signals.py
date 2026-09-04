@@ -1,5 +1,6 @@
-from django.db.models.signals import post_save, pre_save
+from django.db.models.signals import post_save, pre_save, pre_delete
 from django.dispatch import receiver
+import decimal
 from django.contrib.auth.models import User
 from main.models import InspectorMapping, FoodSafetyAgencyInspection, InspectionGroup
 
@@ -130,6 +131,74 @@ def capture_group_changes(sender, instance, **kwargs):
             change_count=len(changes),
         )
     except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Deletion archive
+# ---------------------------------------------------------------------------
+
+def _json_safe(value):
+    """Coerce a model field value into something JSONField can store."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, decimal.Decimal):
+        # str, not float — keeps cent-level precision for money/km/hours.
+        return str(value)
+    if hasattr(value, 'isoformat'):          # date / datetime / time
+        return value.isoformat()
+    if isinstance(value, (list, dict)):
+        return value
+    return str(value)
+
+
+@receiver(pre_delete, sender=FoodSafetyAgencyInspection)
+def archive_deleted_inspection(sender, instance, **kwargs):
+    """Snapshot an inspection into DeletedInspectionArchive before it is removed.
+
+    Hooked on pre_delete rather than at the individual call sites because
+    inspections are deleted from five different places (the Next.js edit
+    wizard, the legacy Django edit form, two single-delete views and the
+    group delete) — and from cascades. A model-level hook cannot be bypassed
+    by a new code path someone adds later.
+
+    Every field is captured generically off _meta, so fields added to the
+    inspection model in future are archived without touching this function.
+    """
+    from main.models import DeletedInspectionArchive, InspectionDocument
+    from main.middleware import get_current_user, get_current_path
+
+    try:
+        snapshot = {
+            f.name: _json_safe(f.value_from_object(instance))
+            for f in instance._meta.concrete_fields
+        }
+
+        # Captured BEFORE the cascade wipes them.
+        documents = [{
+            'document_type': d.document_type,
+            'uploaded_date': d.uploaded_date.isoformat() if d.uploaded_date else None,
+            'uploaded_by': (d.uploaded_by.get_full_name() or d.uploaded_by.username) if d.uploaded_by else None,
+        } for d in InspectionDocument.objects.filter(inspection_id=instance.pk).select_related('uploaded_by')]
+
+        user = get_current_user()
+        DeletedInspectionArchive.objects.create(
+            original_id=instance.pk,
+            remote_id=instance.remote_id,
+            inspection_group_ref=instance.inspection_group_id,
+            client_name=instance.client_name or '',
+            commodity=instance.commodity or '',
+            product_name=instance.product_name or '',
+            date_of_inspection=instance.date_of_inspection,
+            inspector_name=instance.inspector_name or '',
+            snapshot=snapshot,
+            documents=documents,
+            document_count=len(documents),
+            deleted_by=user if user and getattr(user, 'is_authenticated', False) else None,
+            source=(get_current_path() or '')[:200],
+        )
+    except Exception:
+        # Archiving must never be the reason a delete fails.
         pass
 
 

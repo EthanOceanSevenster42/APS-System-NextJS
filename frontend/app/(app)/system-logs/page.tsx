@@ -17,15 +17,43 @@ interface EditHistoryEntry {
   id: number; edited_at: string; edited_by: string; object_type: string; client_name: string;
   date_of_inspection: string; change_count: number; changes: Record<string, { label: string; old: string; new: string }>;
 }
+interface DeletionDoc { document_type: string; uploaded_by: string | null; uploaded_date: string | null; }
+interface DeletionEntry {
+  id: number; deleted_at: string; deleted_by: string; original_id: number;
+  inspection_group_ref: number | null; client_name: string; commodity: string;
+  product_name: string; inspector_name: string; date_of_inspection: string;
+  document_count: number; documents: DeletionDoc[]; snapshot: Record<string, unknown>;
+  source: string; restored_at: string; restored_by: string; restored_to_id: number | null;
+}
 interface Stats {
   total_events: number; events_today: number; active_users: number; file_uploads: number;
-  logins: number; record_edits: number; action_counts: Record<string, number>;
+  logins: number; record_edits: number; record_deletions: number; action_counts: Record<string, number>;
 }
 interface SystemLogsResponse {
   success: boolean; total: number; total_pages: number; page_num: number;
   logs: LogEntry[]; edit_history: EditHistoryEntry[]; edit_history_total: number;
+  deletions: DeletionEntry[]; deletions_total: number;
   all_users: string[]; all_pages: string[]; stats: Stats;
 }
+
+/* Fields worth showing first when a deleted record is expanded. Anything else
+   in the snapshot is still shown, just after these. */
+const SNAPSHOT_PRIMARY: { key: string; label: string }[] = [
+  { key: "commodity", label: "Commodity" },
+  { key: "product_name", label: "Product" },
+  { key: "product_class", label: "Product Class" },
+  { key: "lab", label: "Lab" },
+  { key: "town", label: "Town" },
+  { key: "inspector_name", label: "Inspector" },
+  { key: "date_of_inspection", label: "Inspection Date" },
+  { key: "km_traveled", label: "KM Traveled" },
+  { key: "hours", label: "Hours" },
+  { key: "bought_sample", label: "Sample Amount (R)" },
+  { key: "is_sample_taken", label: "Sample Taken" },
+  { key: "approved_status", label: "Approved Status" },
+  { key: "invoice_number", label: "Invoice Number" },
+  { key: "comment", label: "Comment" },
+];
 
 /* ── Filament (FSA teal) tokens ──────────────────────────────────────────── */
 const F = {
@@ -115,6 +143,12 @@ const labelStyle: React.CSSProperties = { display: "block", fontSize: "0.7rem", 
 export default function SystemLogsPage() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [editHistory, setEditHistory] = useState<EditHistoryEntry[]>([]);
+  const [deletions, setDeletions] = useState<DeletionEntry[]>([]);
+  const [deletionsTotal, setDeletionsTotal] = useState(0);
+  // Restore is a two-click action: the first click arms the row, the second runs it.
+  const [armedRestore, setArmedRestore] = useState<number | null>(null);
+  const [restoringId, setRestoringId] = useState<number | null>(null);
+  const [restoreMsg, setRestoreMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [allUsers, setAllUsers] = useState<string[]>([]);
   const [allPages, setAllPages] = useState<string[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
@@ -131,7 +165,7 @@ export default function SystemLogsPage() {
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [pageNum, setPageNum] = useState(1);
-  const [activeView, setActiveView] = useState<"logs" | "history">("logs");
+  const [activeView, setActiveView] = useState<"logs" | "history" | "deletions">("logs");
   const [expandedRows, setExpandedRows] = useState<Set<number>>(new Set());
   const toggleRow = (id: number) => setExpandedRows(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
 
@@ -154,6 +188,7 @@ export default function SystemLogsPage() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: SystemLogsResponse = await res.json();
       setLogs(data.logs ?? []); setEditHistory(data.edit_history ?? []);
+      setDeletions(data.deletions ?? []); setDeletionsTotal(data.deletions_total ?? 0);
       setAllUsers(data.all_users ?? []); setAllPages(data.all_pages ?? []);
       setStats(data.stats ?? null); setTotal(data.total ?? 0);
       setTotalPages(data.total_pages ?? 1); setEditHistoryTotal(data.edit_history_total ?? 0);
@@ -169,6 +204,33 @@ export default function SystemLogsPage() {
     doFetch({ pageNum: 1, clear: true });
   };
   const handlePage = (n: number) => { setPageNum(n); doFetch({ pageNum: n }); };
+
+  const handleRestore = async (d: DeletionEntry) => {
+    setRestoringId(d.id); setRestoreMsg(null);
+    try {
+      const res = await fetch("/api/restore-deleted-inspection", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ archive_id: d.id }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        const docs: string[] = data.documents_to_reupload ?? [];
+        setRestoreMsg({
+          ok: true,
+          text: `Restored "${d.client_name}" as inspection #${data.restored_id}.`
+            + (docs.length ? ` ${docs.length} file(s) must be re-uploaded: ${docs.join(", ")}.` : ""),
+        });
+        doFetch();
+      } else {
+        setRestoreMsg({ ok: false, text: data.error || "Restore failed." });
+      }
+    } catch (err) {
+      setRestoreMsg({ ok: false, text: err instanceof Error ? err.message : "Restore failed." });
+    } finally {
+      setRestoringId(null); setArmedRestore(null);
+    }
+  };
 
   // Activity-by-type: sorted breakdown
   const actionRows = stats ? Object.entries(stats.action_counts).sort((a, b) => b[1] - a[1]) : [];
@@ -265,12 +327,17 @@ export default function SystemLogsPage() {
         {/* Logs / Edit History */}
         <Section
           noPad
-          title={activeView === "logs" ? "Activity log" : "Inspection edit history"}
-          description={activeView === "logs" ? `Showing ${logs.length} of ${total.toLocaleString()} events` : `${editHistoryTotal} total edits (latest 200)`}
+          title={activeView === "logs" ? "Activity log" : activeView === "history" ? "Inspection edit history" : "Deleted inspections"}
+          description={
+            activeView === "logs" ? `Showing ${logs.length} of ${total.toLocaleString()} events`
+              : activeView === "history" ? `${editHistoryTotal} total edits (latest 200)`
+                : `${deletionsTotal} deleted inspection${deletionsTotal === 1 ? "" : "s"} archived (latest 200) — expand a row to see the full record`
+          }
           action={
             <div style={{ display: "flex", gap: 6 }}>
               <button onClick={() => setActiveView("logs")} style={activeView === "logs" ? btnPrimary : btnSecondary}><i className="fas fa-list" /> Logs</button>
               <button onClick={() => setActiveView("history")} style={activeView === "history" ? btnPrimary : btnSecondary}><i className="fas fa-clock-rotate-left" /> Edit History</button>
+              <button onClick={() => setActiveView("deletions")} style={activeView === "deletions" ? btnPrimary : btnSecondary}><i className="fas fa-trash-can-arrow-up" /> Deletions</button>
             </div>
           }
         >
@@ -347,7 +414,7 @@ export default function SystemLogsPage() {
                 </div>
               )}
             </div>
-          ) : (
+          ) : activeView === "history" ? (
             <div style={{ overflowX: "auto" }}>
               <table className="sl-table">
                 <thead><tr>{["When", "Edited By", "Type", "Client / Facility", "Date", "Fields", "Changes"].map(c => <th key={c}>{c}</th>)}</tr></thead>
@@ -367,6 +434,118 @@ export default function SystemLogsPage() {
                       ))}</td>
                     </tr>
                   ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div style={{ overflowX: "auto" }}>
+              {restoreMsg && (
+                <div style={{
+                  margin: "12px 20px 0", padding: "10px 14px", borderRadius: 8, fontSize: "0.78rem",
+                  background: restoreMsg.ok ? "#ecfdf5" : "#fef2f2",
+                  color: restoreMsg.ok ? "#047857" : "#b91c1c",
+                  border: `1px solid ${restoreMsg.ok ? "#a7f3d0" : "#fecaca"}`,
+                }}>
+                  <i className={`fas ${restoreMsg.ok ? "fa-circle-check" : "fa-circle-exclamation"}`} style={{ marginRight: 7 }} />
+                  {restoreMsg.text}
+                </div>
+              )}
+              <table className="sl-table">
+                <thead><tr>{["When", "Deleted By", "Client / Facility", "Commodity", "Product", "Date", "Files", "Status"].map(c => <th key={c}>{c}</th>)}</tr></thead>
+                <tbody>
+                  {deletions.length === 0 ? (
+                    <tr><td colSpan={8} style={{ textAlign: "center", padding: 40, color: F.faint }}><i className="fas fa-trash-can-arrow-up" style={{ fontSize: 26, display: "block", marginBottom: 10, opacity: 0.5 }} />No inspections have been deleted.</td></tr>
+                  ) : deletions.map(d => {
+                    const isExp = expandedRows.has(d.id);
+                    const snap = d.snapshot || {};
+                    const primaryKeys = new Set(SNAPSHOT_PRIMARY.map(f => f.key));
+                    const rest = Object.entries(snap)
+                      .filter(([k, v]) => !primaryKeys.has(k) && v !== null && v !== "" && v !== false)
+                      .sort(([a], [b]) => a.localeCompare(b));
+                    return (
+                      <React.Fragment key={d.id}>
+                        <tr onClick={() => toggleRow(d.id)} style={{ cursor: "pointer" }}>
+                          <td style={{ color: F.muted, whiteSpace: "nowrap" }}>
+                            <i className={`fas fa-chevron-${isExp ? "down" : "right"}`} style={{ marginRight: 6, fontSize: 9, color: F.faint }} />
+                            {fmtDt(d.deleted_at)}
+                          </td>
+                          <td style={{ fontWeight: 500, color: F.heading, whiteSpace: "nowrap" }}>{d.deleted_by}</td>
+                          <td style={{ fontWeight: 500, color: F.strong }}>{d.client_name || "-"}</td>
+                          <td><span className="sl-badge" style={{ background: "#fee2e2", color: "#dc2626" }}>{d.commodity || "-"}</span></td>
+                          <td style={{ color: F.muted }}>{d.product_name || "-"}</td>
+                          <td style={{ whiteSpace: "nowrap" }}>{d.date_of_inspection ? fmtDate(d.date_of_inspection) : "-"}</td>
+                          <td style={{ textAlign: "center" }}>
+                            <span className="sl-badge" style={{ background: d.document_count ? "#fef3c7" : "#f3f4f6", color: d.document_count ? "#b45309" : "#9ca3af" }}>{d.document_count}</span>
+                          </td>
+                          <td style={{ whiteSpace: "nowrap" }} onClick={e => e.stopPropagation()}>
+                            {d.restored_at ? (
+                              <span className="sl-badge" style={{ background: "#dcfce7", color: "#15803d" }} title={`Restored by ${d.restored_by} as #${d.restored_to_id}`}>
+                                <i className="fas fa-check" style={{ marginRight: 4 }} />Restored #{d.restored_to_id}
+                              </span>
+                            ) : restoringId === d.id ? (
+                              <span style={{ fontSize: "0.75rem", color: F.muted }}><i className="fas fa-spinner fa-spin" /> Restoring…</span>
+                            ) : armedRestore === d.id ? (
+                              <span style={{ display: "inline-flex", gap: 6 }}>
+                                <button onClick={() => handleRestore(d)} style={{ ...btnPrimary, padding: "5px 10px", fontSize: "0.72rem", background: "#047857" }}>Confirm</button>
+                                <button onClick={() => setArmedRestore(null)} style={{ ...btnSecondary, padding: "5px 10px", fontSize: "0.72rem" }}>Cancel</button>
+                              </span>
+                            ) : (
+                              <button onClick={() => { setArmedRestore(d.id); setRestoreMsg(null); }} style={{ ...btnSecondary, padding: "5px 10px", fontSize: "0.72rem" }}>
+                                <i className="fas fa-rotate-left" /> Restore
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                        {isExp && (
+                          <tr><td colSpan={8} style={{ padding: 0, background: "#f8fafc", borderTop: `2px solid #dc2626` }}>
+                            <div style={{ padding: "14px 24px 16px 40px" }}>
+                              <div style={{ fontSize: "0.68rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.04em", color: F.faint, marginBottom: 8 }}>
+                                Deleted record — was inspection #{d.original_id}
+                                {d.inspection_group_ref ? ` in group #${d.inspection_group_ref}` : ""}
+                                {d.source ? ` · via ${d.source}` : ""}
+                              </div>
+                              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(210px, 1fr))", gap: "6px 24px", fontSize: "0.75rem" }}>
+                                {SNAPSHOT_PRIMARY.map(f => (
+                                  <div key={f.key}><b style={{ color: F.strong }}>{f.label}:</b>{" "}
+                                    <span style={{ color: F.muted }}>{String(snap[f.key] ?? "—") || "—"}</span></div>
+                                ))}
+                              </div>
+
+                              {d.documents.length > 0 && (
+                                <>
+                                  <div style={{ fontSize: "0.68rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.04em", color: F.faint, margin: "14px 0 6px" }}>
+                                    Files that were attached ({d.documents.length}) — these were deleted with the record and need re-uploading
+                                  </div>
+                                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                                    {d.documents.map((doc, i) => (
+                                      <span key={i} className="sl-badge" style={{ background: "#fef3c7", color: "#b45309" }}
+                                        title={`${doc.uploaded_by || "Unknown"}${doc.uploaded_date ? " · " + fmtDate(doc.uploaded_date) : ""}`}>
+                                        {doc.document_type?.toUpperCase()}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </>
+                              )}
+
+                              {rest.length > 0 && (
+                                <details style={{ marginTop: 14 }}>
+                                  <summary style={{ cursor: "pointer", fontSize: "0.7rem", fontWeight: 600, color: F.primary }}>
+                                    All {rest.length} other stored fields
+                                  </summary>
+                                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(210px, 1fr))", gap: "4px 24px", fontSize: "0.72rem", marginTop: 8 }}>
+                                    {rest.map(([k, v]) => (
+                                      <div key={k}><b style={{ color: F.strong }}>{k}:</b>{" "}
+                                        <span style={{ color: F.muted, wordBreak: "break-word" }}>{String(v)}</span></div>
+                                    ))}
+                                  </div>
+                                </details>
+                              )}
+                            </div>
+                          </td></tr>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

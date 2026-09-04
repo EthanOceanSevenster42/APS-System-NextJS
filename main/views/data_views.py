@@ -4248,6 +4248,49 @@ def api_system_logs(request):
         except Exception:
             pass
 
+        # Deletions — archived inspections, so a removed record can still be
+        # inspected (and restored) long after the fact.
+        deletions = []
+        deletions_total = 0
+        try:
+            from ..models import DeletedInspectionArchive
+            del_qs = DeletedInspectionArchive.objects.select_related(
+                'deleted_by', 'restored_by').order_by('-deleted_at')
+            if user_filter:
+                del_qs = del_qs.filter(deleted_by__username__icontains=user_filter)
+            if date_from:
+                try:
+                    del_qs = del_qs.filter(deleted_at__date__gte=_dt.strptime(date_from, '%Y-%m-%d').date())
+                except ValueError:
+                    pass
+            if date_to:
+                try:
+                    del_qs = del_qs.filter(deleted_at__date__lte=_dt.strptime(date_to, '%Y-%m-%d').date())
+                except ValueError:
+                    pass
+            deletions_total = del_qs.count()
+            deletions = [{
+                'id': d.id,
+                'deleted_at': d.deleted_at.isoformat() if d.deleted_at else '',
+                'deleted_by': (d.deleted_by.get_full_name() or d.deleted_by.username) if d.deleted_by else 'System',
+                'original_id': d.original_id,
+                'inspection_group_ref': d.inspection_group_ref,
+                'client_name': d.client_name or '',
+                'commodity': d.commodity or '',
+                'product_name': d.product_name or '',
+                'inspector_name': d.inspector_name or '',
+                'date_of_inspection': d.date_of_inspection.isoformat() if d.date_of_inspection else '',
+                'document_count': d.document_count,
+                'documents': d.documents or [],
+                'snapshot': d.snapshot or {},
+                'source': d.source or '',
+                'restored_at': d.restored_at.isoformat() if d.restored_at else '',
+                'restored_by': (d.restored_by.get_full_name() or d.restored_by.username) if d.restored_by else '',
+                'restored_to_id': d.restored_to_id,
+            } for d in del_qs[:200]]
+        except Exception:
+            pass
+
         # Summary stats across the whole filtered log set (not just this page)
         from django.db.models import Count as _Count
         from django.utils import timezone as _tz
@@ -4261,6 +4304,7 @@ def api_system_logs(request):
             'file_uploads': action_counts.get('FILE_UPLOAD', 0),
             'logins': action_counts.get('LOGIN', 0),
             'record_edits': edit_history_total,
+            'record_deletions': deletions_total,
             'action_counts': action_counts,
         }
 
@@ -4274,9 +4318,125 @@ def api_system_logs(request):
             'duplicate_count': len(duplicates),
             'edit_history': edit_history,
             'edit_history_total': edit_history_total,
+            'deletions': deletions,
+            'deletions_total': deletions_total,
             'all_users': all_users,
             'all_pages': all_pages,
             'stats': stats,
+        }))
+    except Exception as e:
+        return _cors(JsonResponse({'success': False, 'error': str(e)}, status=500))
+
+
+# ---------------------------------------------------------------------------
+#  API: Restore a deleted inspection from the archive
+# ---------------------------------------------------------------------------
+@_csrf_exempt
+@require_capability('view_system_logs')
+def api_restore_deleted_inspection(request):
+    """Recreate an inspection from its DeletedInspectionArchive snapshot.
+
+    Restores the inspection row only. The attached files themselves are not
+    brought back — the cascade removed those InspectionDocument rows and the
+    archive records what they were, not their bytes — so the response reports
+    which document types were attached at deletion time for manual re-upload.
+    """
+    from ..models import (
+        DeletedInspectionArchive as _Arc,
+        FoodSafetyAgencyInspection as _Insp,
+        InspectionGroup as _Group,
+    )
+    import json as _json
+    from django.utils import timezone as _tz
+
+    def _cors(r):
+        r['Access-Control-Allow-Origin'] = _get_cors_origin(request)
+        r['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        r['Access-Control-Allow-Headers'] = 'Content-Type'
+        r['Access-Control-Allow-Credentials'] = 'true'
+        return r
+
+    if request.method == 'OPTIONS':
+        return _cors(JsonResponse({'ok': True}))
+    if request.method != 'POST':
+        return _cors(JsonResponse({'success': False, 'error': 'Method not allowed'}, status=405))
+
+    # Restoring writes a record back into live data — keep it to the roles that
+    # already administer the system.
+    _role = getattr(request.user, 'role', '') if getattr(request.user, 'is_authenticated', False) else ''
+    if _role not in ('super_admin', 'developer', 'admin'):
+        return _cors(JsonResponse(
+            {'success': False, 'error': 'You do not have permission to restore deleted inspections.'}, status=403))
+
+    try:
+        data = _json.loads(request.body or '{}')
+        archive_id = data.get('archive_id')
+        if not archive_id:
+            return _cors(JsonResponse({'success': False, 'error': 'archive_id is required'}, status=400))
+
+        arc = _Arc.objects.filter(pk=archive_id).first()
+        if not arc:
+            return _cors(JsonResponse({'success': False, 'error': 'Archive entry not found'}, status=404))
+        if arc.restored_at:
+            return _cors(JsonResponse({
+                'success': False,
+                'error': f'Already restored on {arc.restored_at:%Y-%m-%d %H:%M} as inspection #{arc.restored_to_id}.',
+            }, status=409))
+
+        snapshot = dict(arc.snapshot or {})
+        if not snapshot:
+            return _cors(JsonResponse({'success': False, 'error': 'Archive has no snapshot to restore'}, status=422))
+
+        # Rebuild kwargs from the snapshot. Values were stored JSON-safe, so
+        # hand them back through each field's own to_python() to get real
+        # dates/decimals again. FKs are stored as raw ids, hence the _id names.
+        field_map = {f.name: f for f in _Insp._meta.concrete_fields}
+        kwargs = {}
+        for name, value in snapshot.items():
+            f = field_map.get(name)
+            if f is None or f.primary_key:
+                continue          # unknown/removed field, or the old pk
+            if f.is_relation:
+                kwargs[f.attname] = value      # e.g. client_id, approved_by_id
+            elif value is None:
+                kwargs[name] = None
+            else:
+                try:
+                    kwargs[name] = f.to_python(value)
+                except Exception:
+                    kwargs[name] = value
+
+        # Don't resurrect a pointer to a group that has since been deleted.
+        gid = kwargs.get('inspection_group_id')
+        if gid and not _Group.objects.filter(pk=gid).exists():
+            kwargs['inspection_group_id'] = None
+
+        restored = _Insp.objects.create(**kwargs)
+
+        arc.restored_at = _tz.now()
+        arc.restored_by = request.user if getattr(request.user, 'is_authenticated', False) else None
+        arc.restored_to_id = restored.pk
+        arc.save(update_fields=['restored_at', 'restored_by', 'restored_to_id'])
+
+        try:
+            from ..models import SystemLog
+            SystemLog.log_activity(
+                user=request.user,
+                action='UPDATE',
+                page='/system-logs',
+                object_type='inspection',
+                object_id=str(restored.pk),
+                description=(f'Restored deleted inspection "{arc.client_name}" ({arc.commodity}) '
+                             f'— was #{arc.original_id}, now #{restored.pk}'),
+            )
+        except Exception:
+            pass
+
+        return _cors(JsonResponse({
+            'success': True,
+            'restored_id': restored.pk,
+            'original_id': arc.original_id,
+            'documents_to_reupload': [d.get('document_type') for d in (arc.documents or [])],
         }))
     except Exception as e:
         return _cors(JsonResponse({'success': False, 'error': str(e)}, status=500))
@@ -5974,15 +6134,17 @@ def api_edit_inspection_group(request):
                         if commodity in explicitly_removed:
                             to_delete.extend(existing)
 
-                # SAFETY: never hard-delete an inspection that has attached
-                # documents (RFI / COA / compliance checklist / etc.). Deleting
-                # the inspection cascades to InspectionDocument (on_delete=CASCADE)
-                # and the attached checklist vanishes. If a removed commodity
-                # still has documents, keep the record instead of destroying them.
+                # SAFETY: deleting an inspection cascades to InspectionDocument
+                # (on_delete=CASCADE), so its attached checklist/COA/RFI files go
+                # with it. Only do that when the user EXPLICITLY confirmed the
+                # removal in the edit form (which warns the files will be
+                # deleted). Any other request leaves a documented inspection
+                # alone, so nothing is ever lost silently.
                 from ..models import InspectionDocument as _InspDoc
+                _confirmed_delete = bool(data.get('confirm_delete_files', False))
                 for rel in to_delete:
-                    if _InspDoc.objects.filter(inspection_id=rel.id).exists():
-                        continue  # has attached documents — do not delete
+                    if not _confirmed_delete and _InspDoc.objects.filter(inspection_id=rel.id).exists():
+                        continue  # has attached documents and not confirmed — keep
                     rel.delete()
 
                 for rel in to_update:
