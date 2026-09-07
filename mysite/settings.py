@@ -90,6 +90,12 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    # Compress API responses. The analytics payload is ~3 MB of highly
+    # repetitive JSON (13k inspection rows sharing the same eight keys) and
+    # gzips about 19x, to ~170 KB. Nothing downstream reads the body, so this
+    # is transparent to every view. Must sit above anything that inspects or
+    # rewrites the response body.
+    'django.middleware.gzip.GZipMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',  # Enables static file serving in production
     'main.middleware.ApiAuthJsonMiddleware',  # Convert /api login-redirects to JSON 401 (avoid proxy 502)
     'main.middleware.SecurityHeadersMiddleware',  # Custom security headers middleware

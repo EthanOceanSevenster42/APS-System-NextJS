@@ -1768,6 +1768,7 @@ def api_inspections(request):
                 if p.protein: prod['protein'] = True
                 if p.calcium: prod['calcium'] = True
                 if p.is_direction_present_for_this_inspection: prod['is_direction_present_for_this_inspection'] = True
+                if p.lab_test_results: prod['lab_test_results'] = p.lab_test_results
                 # Use expanded client+date flags so per-product flags match file viewer
                 if _gflag['lab'] or _gflag['coa']: prod['coa_uploaded'] = True
                 if _gflag['composition']: prod['composition_uploaded'] = True
@@ -3141,41 +3142,15 @@ def api_lab_analytics(request):
         # Count "Awaiting COA" at the GROUP level — matches the NO_COA filter on inspections page.
         # Groups with at least one sampled inspection (excluding EGGS/POULTRY-only groups)
         # that have NO InspectionDocument with document_type in ['coa', 'lab', 'lab_form'].
-        from ..models import InspectionGroup as _IG_coa, InspectionDocument as _ID_coa
-        _coa_group_qs = _IG_coa.objects.all()
-        # Match inspections page visibility: exclude corporate for non-inspector/lab_tech roles
-        if _date_from:
-            _coa_group_qs = _coa_group_qs.filter(date_of_inspection__gte=_date_from)
-        if _date_to:
-            _coa_group_qs = _coa_group_qs.filter(date_of_inspection__lte=_date_to)
-        # Must have at least one sampled, non-EGGS/POULTRY inspection
-        _coa_group_qs = _coa_group_qs.filter(
-            Exists(
-                _I.objects.filter(
-                    inspection_group_id=OuterRef('pk'),
-                    is_sample_taken=True,
-                    is_occurrence_report=False,
-                ).exclude(commodity__in=['EGGS', 'POULTRY'])
-            )
-        )
-        if _lab_filter:
-            _coa_group_qs = _coa_group_qs.filter(
-                Exists(_I.objects.filter(inspection_group_id=OuterRef('pk'), lab__in=_lab_keys))
-            )
-        if _commodity_filter:
-            _coa_group_qs = _coa_group_qs.filter(
-                Exists(_I.objects.filter(inspection_group_id=OuterRef('pk'), commodity=_commodity_filter))
-            )
-        # Exclude groups with COA doc (by group_id OR by client_name+date for duplicates)
-        _coa_doc_exists = Exists(
-            _ID_coa.objects.filter(
-                Q(inspection__inspection_group_id=OuterRef('pk'))
-                | Q(inspection__client_name=OuterRef('client_name'),
-                    inspection__date_of_inspection=OuterRef('date_of_inspection')),
-                document_type__in=['coa', 'lab', 'lab_form']
-            )
-        )
-        needs_coa = _coa_group_qs.exclude(_coa_doc_exists).count()
+        # Single shared definition, so this tile and the Analytics > Timelines
+        # backlog can never drift apart again. See views/utils.py.
+        from .utils import outstanding_coa_groups
+        needs_coa = outstanding_coa_groups(
+            date_from=_date_from or None,
+            date_to=_date_to or None,
+            lab_keys=_lab_keys if _lab_filter else None,
+            commodity=_commodity_filter or None,
+        ).count()
         needs_retest    = base.filter(needs_retest__in=['Yes', 'YES', 'yes']).count()
         fat_count       = base.filter(fat=True).count()
         protein_count   = base.filter(protein=True).count()
@@ -3252,6 +3227,54 @@ def api_lab_analytics(request):
                 'date':           r['date_of_inspection'].isoformat() if r['date_of_inspection'] else '',
             })
 
+        # Daily compliance trend per test type, from the per-test COA outcome
+        # captured on upload (lab_test_results). One point per day per test:
+        # the share of that day's assessed results which came back compliant.
+        # Only inspections whose COA has actually been marked up contribute —
+        # a test that was never assessed must not read as a failure.
+        from collections import defaultdict as _dd
+        _VALID_TESTS = ('fat', 'protein', 'calcium', 'dna')
+        _tally = _dd(lambda: _dd(lambda: [0, 0]))     # day -> test -> [compliant, assessed]
+        for _day, _res in base.exclude(lab_test_results={}).exclude(
+                lab_test_results__isnull=True).values_list(
+                'date_of_inspection', 'lab_test_results'):
+            if not _day or not isinstance(_res, dict):
+                continue
+            _key = _day.isoformat()
+            for _t, _v in _res.items():
+                if _t not in _VALID_TESTS or _v not in ('compliant', 'non-compliant'):
+                    continue
+                _tally[_key][_t][1] += 1
+                if _v == 'compliant':
+                    _tally[_key][_t][0] += 1
+
+        test_compliance_trend = [
+            {
+                'day': _day,
+                'test': _t,
+                'assessed': _n,
+                'compliant': _c,
+                'compliance_rate': round(_c * 100.0 / _n, 1) if _n else 0.0,
+            }
+            for _day in sorted(_tally)
+            for _t, (_c, _n) in sorted(_tally[_day].items())
+        ]
+
+        # Overall pass rate per test across the whole filtered range — the
+        # summary the trend line is the day-by-day breakdown of.
+        _totals = _dd(lambda: [0, 0])
+        for _row in test_compliance_trend:
+            _totals[_row['test']][0] += _row['compliant']
+            _totals[_row['test']][1] += _row['assessed']
+        test_compliance_summary = {
+            _t: {
+                'compliant': _c,
+                'assessed': _n,
+                'compliance_rate': round(_c * 100.0 / _n, 1) if _n else 0.0,
+            }
+            for _t, (_c, _n) in _totals.items()
+        }
+
         # Filter options — always show ALL known labs (even with 0 samples)
         all_labs_options = list(_LAB_DISPLAY.values())
         _all_base = _I.objects.filter(is_sample_taken=True)
@@ -3273,6 +3296,8 @@ def api_lab_analytics(request):
             'allLabsStats':    all_labs_stats,
             'allCommoditiesStats': all_commodities_stats,
             'monthly':         monthly,
+            'testComplianceTrend':   test_compliance_trend,
+            'testComplianceSummary': test_compliance_summary,
             'recent':          recent,
             'allLabs':         sorted(set(all_labs_options)),
             'allCommodities':  sorted(set(all_commodities_options)),

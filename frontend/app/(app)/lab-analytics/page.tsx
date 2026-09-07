@@ -6,6 +6,7 @@ import dynamic from "next/dynamic";
 // chart.js is heavy; load it lazily in its own chunk (shared with other analytics
 // pages) instead of shipping it in this route's initial JS bundle.
 const Bar = dynamic(() => import("@/components/charts").then(m => m.Bar), { ssr: false });
+const Line = dynamic(() => import("@/components/charts").then(m => m.Line), { ssr: false });
 
 interface LabData {
   total_samples:      number;
@@ -22,6 +23,8 @@ interface LabData {
   allLabsStats:   { lab: string; n: number }[];
   allCommoditiesStats: { commodity: string; n: number }[];
   monthly:        { month: string; count: number }[];
+  testComplianceTrend?:   TestTrendRow[];
+  testComplianceSummary?: Record<string, TestSummary>;
   recent:         {
     client_name:  string;
     product_name: string;
@@ -57,6 +60,78 @@ const TEST_CONFIG = [
   { key: "calcium_count", label: "Calcium", color: "#10b981", icon: "fa-atom"     },
   { key: "dna_count",     label: "DNA",     color: "#f59e0b", icon: "fa-dna"      },
 ] as const;
+
+/* Series for the daily per-test compliance trend. Colours match TEST_CONFIG so
+   a test is the same colour wherever it appears on this page. */
+const TEST_SERIES = [
+  { key: "fat",     label: "Fat",     color: "#3b82f6" },
+  { key: "protein", label: "Protein", color: "#8b5cf6" },
+  { key: "calcium", label: "Calcium", color: "#10b981" },
+  { key: "dna",     label: "DNA",     color: "#f59e0b" },
+] as const;
+
+interface TestTrendRow {
+  day: string;
+  test: string;
+  assessed: number;
+  compliant: number;
+  compliance_rate: number;
+}
+interface TestSummary { compliant: number; assessed: number; compliance_rate: number }
+
+type Granularity = "day" | "week" | "month" | "year";
+
+/* maxPoints caps how much of the range a view draws. 545 daily points on one
+   axis is unreadable whatever the styling, so Day shows a recent window and
+   the coarser views cover the longer spans. Each cap is roughly the number of
+   labels that stay legible across the card's width. */
+const GRANULARITIES: { key: Granularity; label: string; maxPoints: number; span: string }[] = [
+  { key: "day",   label: "Day",   maxPoints: 45,  span: "days"   },
+  { key: "week",  label: "Week",  maxPoints: 26,  span: "weeks"  },
+  { key: "month", label: "Month", maxPoints: 24,  span: "months" },
+  { key: "year",  label: "Year",  maxPoints: 20,  span: "years"  },
+];
+
+const MONTHS_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/* Periods with no assessed result are plotted as 0% so every series draws as
+   one continuous line. Note the consequence, called out under the chart: a
+   plunge to 0% can mean "nothing was tested" rather than "everything failed",
+   and a period with only one or two samples swings the full height of the
+   chart on a single result. The tooltip carries the sample count behind every
+   point, which is the way to tell the two apart. */
+
+/** Collapse an ISO day into the bucket it belongs to. Sortable as a string. */
+function bucketKey(iso: string, g: Granularity): string {
+  if (g === "year")  return iso.slice(0, 4);
+  if (g === "month") return iso.slice(0, 7);
+  if (g === "week") {
+    const d = new Date(iso + "T00:00:00");
+    // Back up to Monday so a week is labelled by the date it commences.
+    const dow = (d.getDay() + 6) % 7;
+    d.setDate(d.getDate() - dow);
+    return d.toISOString().slice(0, 10);
+  }
+  return iso;
+}
+
+function bucketLabel(key: string, g: Granularity): string {
+  if (g === "year") return key;
+  if (g === "month") {
+    const [y, m] = key.split("-");
+    return `${MONTHS_SHORT[Number(m) - 1]} ${y}`;
+  }
+  const [y, m, d] = key.split("-");
+  const base = `${d} ${MONTHS_SHORT[Number(m) - 1]}`;
+  return g === "week" ? `${base} ${y.slice(2)}` : base;
+}
+
+function fmtTrendDay(iso: string): string {
+  const d = new Date(iso + "T00:00:00");
+  return isNaN(d.getTime())
+    ? iso
+    : `${String(d.getDate()).padStart(2, "0")} ${d.toLocaleString("en", { month: "short" })}`;
+}
 
 function Spinner() {
   return (
@@ -128,6 +203,8 @@ export default function LabAnalyticsPage() {
   const [dateTo, setDateTo] = useState("");
   const [labFilter, setLabFilter] = useState("");
   const [commodityFilter, setCommodityFilter] = useState("");
+  // Month reads best across a multi-year range; day is there when you need it.
+  const [granularity, setGranularity] = useState<Granularity>("month");
   const [allLabsList, setAllLabsList] = useState<string[]>([]);
   const [allCommoditiesList, setAllCommoditiesList] = useState<string[]>([]);
   const [initialLoaded, setInitialLoaded] = useState(false);
@@ -738,6 +815,210 @@ export default function LabAnalyticsPage() {
             <StatCard label="Needs Retest" value={data?.needs_retest ?? 0} icon="fa-redo-alt" color="#ef4444" borderColor="#ef4444" loading={loading} tooltip="Samples flagged for retesting due to failed or inconclusive lab results. Click to view." href="/inspections?needs_retest=NEEDS_RETEST" />
           </div>
 
+          {/* Full-width: per-test compliance trend */}
+          <div className="la-card" style={{ marginBottom: 16 }}>
+            <div style={{
+              display: "flex", alignItems: "center", justifyContent: "space-between",
+              flexWrap: "wrap", gap: 10, marginBottom: 4,
+            }}>
+              <p className="la-section-title" style={{ margin: 0 }}>
+                <i className="fas fa-chart-line" style={{ fontSize: "1rem", color: "#007890" }} />
+                Compliance Trend by Test
+              </p>
+              <div style={{ display: "flex", border: "1px solid #e5e7eb", borderRadius: 6, overflow: "hidden" }}>
+                {GRANULARITIES.map((g, i) => (
+                  <button
+                    key={g.key}
+                    type="button"
+                    onClick={() => setGranularity(g.key)}
+                    style={{
+                      padding: "5px 12px", fontSize: "0.75rem", fontWeight: 600, cursor: "pointer",
+                      border: "none", borderLeft: i === 0 ? "none" : "1px solid #e5e7eb",
+                      background: granularity === g.key ? "#007890" : "#fff",
+                      color: granularity === g.key ? "#fff" : "#6b7280",
+                      transition: "all 0.15s ease",
+                    }}
+                  >
+                    {g.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {loading ? (
+              <div style={{ padding: "24px 0", textAlign: "center" }}><Spinner /></div>
+            ) : (() => {
+              const rows = data?.testComplianceTrend ?? [];
+              if (rows.length === 0) {
+                return (
+                  <div style={{
+                    padding: "28px 20px", textAlign: "center",
+                    color: "#6b7280", fontSize: "0.8rem", lineHeight: 1.6,
+                  }}>
+                    <i className="fas fa-chart-line" style={{ fontSize: 22, color: "#d1d5db", display: "block", marginBottom: 10 }} />
+                    <b style={{ color: "#374151" }}>No per-test results yet.</b><br />
+                    This chart plots the Fat / Protein / Calcium / DNA outcomes captured
+                    when a COA/Lab result is uploaded on the Inspection Records page.
+                    It fills in as those results are marked.
+                  </div>
+                );
+              }
+
+              // Roll the daily rows up into the chosen bucket. Rates are
+              // recomputed from summed counts, never averaged from daily
+              // percentages — a day with 1 sample must not weigh the same as a
+              // day with 40.
+              const buckets = new Map<string, Map<string, { c: number; n: number }>>();
+              for (const r of rows) {
+                const key = bucketKey(r.day, granularity);
+                let per = buckets.get(key);
+                if (!per) { per = new Map(); buckets.set(key, per); }
+                const cur = per.get(r.test) ?? { c: 0, n: 0 };
+                cur.c += r.compliant;
+                cur.n += r.assessed;
+                per.set(r.test, cur);
+              }
+              const allKeys = [...buckets.keys()].sort();
+              const gcfg = GRANULARITIES.find(g => g.key === granularity)!;
+              // Keep the most recent slice: trends are read from the near end.
+              const keys = allKeys.slice(-gcfg.maxPoints);
+              const hidden = allKeys.length - keys.length;
+              const summary = data?.testComplianceSummary ?? {};
+
+              // Every test that has any result at all is drawn; periods with
+              // none are zero-filled below so the line stays continuous.
+              const shown = TEST_SERIES.filter(s => rows.some(r => r.test === s.key));
+
+              return (
+                <>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8, margin: "12px 0 14px" }}>
+                    {TEST_SERIES.filter(s => summary[s.key]?.assessed).map(s => {
+                      const su = summary[s.key];
+                      return (
+                        <div key={s.key} style={{
+                          display: "flex", alignItems: "center", gap: 7,
+                          padding: "6px 10px", borderRadius: 6,
+                          border: "1px solid #e5e7eb", background: "#fafafa",
+                        }}>
+                          <span style={{ width: 9, height: 9, borderRadius: "50%", background: s.color }} />
+                          <span style={{ fontSize: "0.75rem", fontWeight: 600, color: "#374151" }}>{s.label}</span>
+                          <span style={{ fontSize: "0.8rem", fontWeight: 700, color: s.color }}>
+                            {su.compliance_rate}%
+                          </span>
+                          <span style={{ fontSize: "0.68rem", color: "#9ca3af" }}>
+                            {su.compliant}/{su.assessed}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div style={{ position: "relative", height: 340 }}>
+                    <Line
+                      data={{
+                        labels: keys.map(k => bucketLabel(k, granularity)),
+                        datasets: shown
+                          .map(s => ({
+                            label: s.label,
+                            // null (not undefined) so Chart.js breaks the line
+                            // over periods with no assessed result, rather than
+                            // drawing through them as if they were measured.
+                            data: keys.map(k => {
+                              const v = buckets.get(k)?.get(s.key);
+                              // Real rate whenever anything was assessed, 0 when
+                              // nothing was - see the caveat under the chart.
+                              return v && v.n ? Math.round((v.c / v.n) * 1000) / 10 : 0;
+                            }),
+                            borderColor: s.color,
+                            backgroundColor: s.color,
+                            pointBackgroundColor: s.color,
+                            pointRadius: keys.length > 30 ? 2 : 3,
+                            pointHoverRadius: 5,
+                            borderWidth: 2,
+                            tension: 0.3,
+                            spanGaps: true,
+                          })),
+                      }}
+                      options={{
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        interaction: { mode: "index" as const, intersect: false },
+                        plugins: {
+                          legend: { display: false },
+                          tooltip: {
+                            mode: "index" as const,
+                            intersect: false,
+                            callbacks: {
+                              label: (ctx: unknown) => {
+                                const c = ctx as { dataset: { label: string }; parsed: { y: number | null }; dataIndex: number };
+                                if (c.parsed.y === null) return "";
+                                const key = TEST_SERIES.find(s => s.label === c.dataset.label)?.key ?? "";
+                                const v = buckets.get(keys[c.dataIndex])?.get(key);
+                                // Spell out a zero-filled point so it is never
+                                // mistaken for a total failure.
+                                if (!v || !v.n) return `${c.dataset.label}: no results captured`;
+                                return `${c.dataset.label}: ${c.parsed.y.toFixed(1)}% (${v.c}/${v.n})`;
+                              },
+                            },
+                          },
+                        },
+                        scales: {
+                          x: {
+                            ticks: {
+                              font: { size: 10 },
+                              maxRotation: granularity === "day" || granularity === "week" ? 45 : 0,
+                              minRotation: 0,
+                              autoSkip: true,
+                              maxTicksLimit: granularity === "day" ? 15 : 14,
+                            },
+                            grid: { color: "rgba(0,0,0,0.04)" },
+                          },
+                          y: {
+                            min: 0, max: 105,
+                            ticks: { font: { size: 10 }, stepSize: 10, callback: (v: unknown) => (v as number) <= 100 ? `${v}%` : "" },
+                            title: { display: true, text: "Compliance %", font: { size: 11 } },
+                            grid: { color: "rgba(0,0,0,0.06)" },
+                          },
+                        },
+                      }}
+                    />
+                  </div>
+
+                  <div style={{
+                    marginTop: 12, padding: "9px 12px", borderRadius: 6,
+                    background: "#fffbeb", border: "1px solid #fde68a",
+                    fontSize: "0.7rem", color: "#92400e", lineHeight: 1.55,
+                    display: "flex", alignItems: "flex-start", gap: 8,
+                  }}>
+                    <i className="fas fa-circle-info" style={{ marginTop: 2, flexShrink: 0 }} />
+                    <span>
+                      <b>A sharp fall to 0% may just be missing data.</b>{" "}
+                      Periods with no captured result are shown as 0%, so a drop does not
+                      always mean samples failed. Tests assessed only once or twice in a
+                      period also swing the full height of the chart on a single result —
+                      hover any point to see the sample count behind it, or use
+                      {" "}<b>{granularity === "day" ? "Week or Month" : "Month or Year"}</b>{" "}
+                      where each point rests on more samples.
+                    </span>
+                  </div>
+                  <div style={{ marginTop: 8, fontSize: "0.68rem", color: "#9ca3af", textAlign: "center" }}>
+                    {hidden > 0 ? (
+                      <>
+                        Showing the most recent {keys.length} {gcfg.span} of {allKeys.length}
+                        {" — switch to "}
+                        {granularity === "day" ? "Week or Month" : granularity === "week" ? "Month or Year" : "Year"}
+                        {" for the full range"}
+                      </>
+                    ) : (
+                      <>{keys.length} {gcfg.span.replace(/s$/, "")}{keys.length === 1 ? "" : "s"} shown — the full range</>
+                    )}
+                    {" · "}0% = no result captured for that period
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+
           {/* Mid row: Tests breakdown + Monthly trend */}
           <div className="la-mid-grid">
 
@@ -793,6 +1074,7 @@ export default function LabAnalyticsPage() {
                 </div>
               ) : null}
             </div>
+
 
             {/* Monthly trend */}
             <div className="la-card">

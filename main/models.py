@@ -674,6 +674,15 @@ class FoodSafetyAgencyInspection(models.Model):
     protein = models.BooleanField(default=False, help_text="Protein testing required")
     calcium = models.BooleanField(default=False, help_text="Calcium testing required")
     dna = models.BooleanField(default=False, help_text="DNA testing required")
+    # Per-test COA/Lab outcome, captured when the COA/Lab result is uploaded.
+    # {"fat": "compliant", "protein": "non-compliant"} — a test that was not
+    # assessed is simply absent, which is why this is a dict and not four more
+    # boolean columns. The booleans above say a test was REQUIRED; this says
+    # how it came back.
+    lab_test_results = models.JSONField(
+        default=dict, blank=True,
+        help_text="Per-test COA/Lab outcome, e.g. {'fat': 'compliant', 'dna': 'non-compliant'}",
+    )
     needs_retest = models.CharField(max_length=3, blank=True, null=True, verbose_name='Needs Retest',
                                   choices=[('YES', 'Yes'), ('NO', 'No')], help_text="Whether this inspection needs retesting")
     

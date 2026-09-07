@@ -353,7 +353,9 @@ def _outstanding_backlog():
              'is_sampled', 'has_invoice', 'has_coa', 'is_billable')
 
     counts = {'approval': 0, 'not_sent': 0, 'invoice': 0}
-    needs_coa = 0
+    # Same definition as the Lab Analytics tile - one source of truth.
+    from .utils import outstanding_coa_groups
+    needs_coa = outstanding_coa_groups().count()
     fully = 0
     total = 0
     for g in groups:
@@ -363,8 +365,6 @@ def _outstanding_backlog():
         coa_ok = (not g['is_sampled']) or g['has_coa']
         # Invoice needed only for PMP/RAW jobs.
         invoice_ok = g['has_invoice'] or (not g['is_billable'])
-        if g['is_sampled'] and not g['has_coa']:
-            needs_coa += 1
         if g['first_approved'] != 'APPROVED':
             counts['approval'] += 1
         elif not g['first_sent']:

@@ -5,8 +5,30 @@ import sys
 import socket
 
 
+def _force_utf8_console():
+    """Stop debug prints from turning a working request into a 500 on Windows.
+
+    A Windows console defaults to cp1252, and this codebase prints emoji in its
+    debug output (2000+ of them across main/). When such a print runs inside a
+    request, encoding it raises UnicodeEncodeError, Django converts that into a
+    500, and the caller gets an HTML error page instead of JSON - which is how
+    a perfectly good file upload ends up as
+    "Unexpected token '<', "<!DOCTYPE "... is not valid JSON" in the browser.
+
+    Reconfiguring to UTF-8 with errors="replace" makes those prints
+    unconditionally safe. No-op on Linux/macOS, which are already UTF-8.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass   # detached or already-wrapped stream: nothing to do
+
+
 def main():
     """Run administrative tasks."""
+    _force_utf8_console()
     os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'mysite.settings')
     socket.setdefaulttimeout(300)  # 5 minutes timeout
     try:

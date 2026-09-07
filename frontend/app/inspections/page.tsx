@@ -3,6 +3,17 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import MultiSelectDropdown from "@/components/ui/MultiSelectDropdown";
 
+/* The sampling options a COA/Lab result can report on. `requested` on the
+   product says a test was asked for; lab_test_results says how it came back. */
+type LabTest = 'fat' | 'protein' | 'calcium' | 'dna';
+type LabOutcome = 'compliant' | 'non-compliant';
+const LAB_TESTS: { key: LabTest; label: string }[] = [
+  { key: 'fat',     label: 'Fat'     },
+  { key: 'protein', label: 'Protein' },
+  { key: 'calcium', label: 'Calcium' },
+  { key: 'dna',     label: 'DNA'     },
+];
+
 interface Product {
   id: number;
   commodity: string;
@@ -12,6 +23,7 @@ interface Product {
   fat: boolean;
   protein: boolean;
   calcium: boolean;
+  lab_test_results?: Partial<Record<LabTest, LabOutcome>>;
   is_direction_present_for_this_inspection: boolean;
   is_product_compliant: boolean;
   is_sample_taken: boolean;
@@ -36,6 +48,7 @@ function normalizeProduct(p: Partial<Product> & { id: number }): Product {
     fat: p.fat ?? false,
     protein: p.protein ?? false,
     calcium: p.calcium ?? false,
+    lab_test_results: p.lab_test_results ?? undefined,
     is_direction_present_for_this_inspection: p.is_direction_present_for_this_inspection ?? false,
     is_product_compliant: p.is_product_compliant ?? true,
     is_sample_taken: p.is_sample_taken ?? false,
@@ -414,6 +427,7 @@ export default function InspectionsPage() {
     documentType: string;
     productId: number;
     complianceStatus?: string;
+    labTestResults?: Record<string, string>;
   } | null>(null);
 
   // Compliance modal state
@@ -424,7 +438,20 @@ export default function InspectionsPage() {
     groupId: string;
     productId: number;
     documentType: string;
+    // COA/Lab only: tests requested on the product, so the ones actually
+    // sampled are marked in the modal.
+    requested?: LabTest[];
   } | null>(null);
+
+  // COA/Lab modal: every test sits on a three-way segment
+  // (Not tested / Compliant / Non-Compliant). A test with no entry here simply
+  // was not assessed, so the selection is implied rather than a separate step.
+  const [labResults, setLabResults] = useState<Partial<Record<LabTest, LabOutcome>>>({});
+
+  const closeLabModal = useCallback(() => {
+    setComplianceModal(null);
+    setLabResults({});
+  }, []);
 
   // Filesystem file info cache per group (keyed by group_id)
   const [groupFiles, setGroupFiles] = useState<Record<string, Record<string, FileItem[]>>>({});
@@ -960,7 +987,7 @@ export default function InspectionsPage() {
   }, [flaggedGroups, showToast]);
 
   // Core upload function
-  const performUpload = useCallback(async (file: File, inspectionId: number, groupId: string, documentType: string, productId: number, complianceStatus?: string) => {
+  const performUpload = useCallback(async (file: File, inspectionId: number, groupId: string, documentType: string, productId: number, complianceStatus?: string, labTestResults?: Record<string, string>) => {
     const key = `${documentType}-${productId}`;
     setUploadingKeys(prev => new Set(prev).add(key));
     console.log(`[Upload] Starting: type=${documentType}, file=${file.name}, inspectionId=${inspectionId}, groupId=${groupId}, productId=${productId}, compliance=${complianceStatus}`);
@@ -989,6 +1016,9 @@ export default function InspectionsPage() {
       }
       if (complianceStatus) formData.append('compliance_status', complianceStatus);
       if (complianceStatus) formData.append('product_compliance_status', complianceStatus);
+      if (labTestResults && Object.keys(labTestResults).length) {
+        formData.append('lab_test_results', JSON.stringify(labTestResults));
+      }
 
       console.log(`[Upload] Sending to /api/upload-document:`, Object.fromEntries(formData.entries()));
       const res = await fetch('/api/upload-document', {
@@ -1060,7 +1090,7 @@ export default function InspectionsPage() {
     const file = e.target.files?.[0];
     const pending = pendingUploadRef.current;
     if (file && pending) {
-      performUpload(file, pending.inspectionId, pending.groupId, pending.documentType, pending.productId, pending.complianceStatus);
+      performUpload(file, pending.inspectionId, pending.groupId, pending.documentType, pending.productId, pending.complianceStatus, pending.labTestResults);
     }
     // Reset input so same file can be selected again
     if (fileInputRef.current) fileInputRef.current.value = '';
@@ -1107,7 +1137,7 @@ export default function InspectionsPage() {
   }, [sendingId, showToast]);
 
   // Trigger file picker for a specific upload
-  const triggerUpload = useCallback((inspectionId: number, groupId: string, documentType: string, productId: number) => {
+  const triggerUpload = useCallback((inspectionId: number, groupId: string, documentType: string, productId: number, requested?: LabTest[]) => {
     // For compliance and composition uploads, show compliance status modal first
     if (documentType === 'compliance' || documentType === 'composition') {
       setComplianceModal({
@@ -1117,11 +1147,12 @@ export default function InspectionsPage() {
       return;
     }
 
-    // For COA/Lab uploads, show COA compliance modal first
+    // For COA/Lab uploads, capture a per-test result first.
     if (documentType === 'lab') {
+      setLabResults({});
       setComplianceModal({
         show: true, type: 'coa',
-        inspectionId, groupId, productId, documentType,
+        inspectionId, groupId, productId, documentType, requested,
       });
       return;
     }
@@ -1130,6 +1161,38 @@ export default function InspectionsPage() {
     pendingUploadRef.current = { inspectionId, groupId, documentType, productId };
     fileInputRef.current?.click();
   }, []);
+
+  // COA/Lab: proceed to the file picker carrying the per-test outcome.
+  const handleLabResultsSubmit = useCallback(() => {
+    if (!complianceModal) return;
+    const chosen = LAB_TESTS
+      .filter(t => labResults[t.key])
+      .map(t => [t.key, labResults[t.key] as LabOutcome] as const);
+    if (chosen.length === 0) return;   // the button is disabled in this state
+    const { inspectionId, groupId, productId, documentType } = complianceModal;
+
+    // Mirror what the backend derives, so the optimistic UI update below
+    // matches what actually gets stored.
+    const overall = chosen.some(([, v]) => v === 'non-compliant') ? 'non-compliant' : 'compliant';
+    pendingUploadRef.current = {
+      inspectionId, groupId, documentType, productId,
+      complianceStatus: overall,
+      labTestResults: Object.fromEntries(chosen) as Record<string, string>,
+    };
+
+    // Open the picker BEFORE touching React state. Browsers only honour a
+    // programmatic file-input click while the user gesture is still active,
+    // so closing the modal first risks the dialog silently never appearing.
+    const input = fileInputRef.current;
+    if (!input) {
+      showToast('Could not open the file picker — please reload the page.');
+      return;
+    }
+    input.click();
+
+    setComplianceModal(null);
+    setLabResults({});
+  }, [complianceModal, labResults, showToast]);
 
   // Handle compliance status selection from modal
   const handleComplianceSelect = useCallback((status: string) => {
@@ -1672,7 +1735,10 @@ export default function InspectionsPage() {
                                 label="COA/Lab"
                                 uploaded={product.coa_uploaded}
                                 uploadKey={`lab-${product.id}`}
-                                onClick={() => triggerUpload(product.id, s.group_id || '', 'lab', product.id)}
+                                onClick={() => triggerUpload(
+                                  product.id, s.group_id || '', 'lab', product.id,
+                                  LAB_TESTS.filter(t => product[t.key]).map(t => t.key),
+                                )}
                               />
                               <UploadBtn
                                 label="Lab Form"
@@ -1870,44 +1936,158 @@ export default function InspectionsPage() {
           position: "fixed", top: 0, left: 0, right: 0, bottom: 0,
           background: "rgba(0,0,0,0.5)", display: "flex",
           alignItems: "center", justifyContent: "center", zIndex: 9999,
-        }} onClick={() => setComplianceModal(null)}>
+        }} onClick={closeLabModal}>
           <div style={{
-            background: "white", borderRadius: 12, padding: 24,
-            maxWidth: 400, width: "90%", boxShadow: "0 20px 60px rgba(0,0,0,0.3)",
+            background: "#fff", borderRadius: 6, padding: 16,
+            maxWidth: 430, width: "90%", border: "1px solid #e5e7eb",
+            boxShadow: "0 4px 6px -1px rgba(0,0,0,0.1),0 2px 4px -1px rgba(0,0,0,0.06)",
           }} onClick={e => e.stopPropagation()}>
-            <h3 style={{ margin: "0 0 8px", fontSize: 18, color: "#1f2937" }}>COA/Lab Compliance Status</h3>
-            <p style={{ margin: "0 0 20px", fontSize: 14, color: "#6b7280" }}>
-              Select the compliance status for this COA/Lab result:
-            </p>
-            <div style={{ display: "flex", gap: 12 }}>
-              <button
-                style={{
-                  flex: 1, padding: "12px 16px", background: "#22c55e", color: "white",
-                  border: "none", borderRadius: 8, cursor: "pointer", fontSize: 14, fontWeight: 600,
-                }}
-                onClick={() => handleComplianceSelect('compliant')}
-              >
-                Compliant
-              </button>
-              <button
-                style={{
-                  flex: 1, padding: "12px 16px", background: "#ef4444", color: "white",
-                  border: "none", borderRadius: 8, cursor: "pointer", fontSize: 14, fontWeight: 600,
-                }}
-                onClick={() => handleComplianceSelect('non-compliant')}
-              >
-                Non-Compliant
-              </button>
+            {/* Header — matches .ir-card-header */}
+            <div style={{
+              padding: "16px", borderBottom: "1px solid #e5e7eb",
+              margin: "-16px -16px 0",
+            }}>
+              <div style={{ fontSize: "1rem", fontWeight: 600, color: "#1f2937" }}>
+                COA/Lab Test Results
+              </div>
+              <div style={{ fontSize: "0.8125rem", color: "#6b7280", marginTop: 3 }}>
+                Mark each test the lab assessed as compliant or non-compliant.
+                Click the same answer again to clear it back to <b>Not tested</b>.
+              </div>
             </div>
-            <button
-              style={{
-                marginTop: 12, width: "100%", padding: "8px", background: "#e5e7eb",
-                color: "#374151", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 13,
-              }}
-              onClick={() => setComplianceModal(null)}
-            >
-              Cancel
-            </button>
+
+            {/* Test rows */}
+            <div style={{ padding: "16px 16px 0" }}>
+              <div style={{ border: "1px solid #e5e7eb", borderRadius: 6, overflow: "hidden" }}>
+                {LAB_TESTS.map((t, i) => {
+                  const chosen = labResults[t.key];
+                  const wasRequested = complianceModal.requested?.includes(t.key);
+                  const pill = (val: LabOutcome, label: string, colour: string, hover: string) => {
+                    const active = chosen === val;
+                    return (
+                      <button
+                        type="button"
+                        onClick={() => setLabResults(prev => ({
+                          ...prev, [t.key]: prev[t.key] === val ? undefined : val,
+                        }))}
+                        style={{
+                          padding: "6px 12px", borderRadius: 6, cursor: "pointer",
+                          fontSize: "0.8125rem", fontWeight: 500, whiteSpace: "nowrap",
+                          border: `1px solid ${active ? colour : "#e5e7eb"}`,
+                          background: active ? colour : "#fff",
+                          color: active ? "#fff" : "#6b7280",
+                          transition: "all 0.15s ease",
+                          boxShadow: active ? "0 1px 3px rgba(0,0,0,0.05)" : "none",
+                        }}
+                        onMouseEnter={e => {
+                          if (!active) { e.currentTarget.style.borderColor = colour; e.currentTarget.style.color = hover; }
+                        }}
+                        onMouseLeave={e => {
+                          if (!active) { e.currentTarget.style.borderColor = "#e5e7eb"; e.currentTarget.style.color = "#6b7280"; }
+                        }}
+                      >
+                        {label}
+                      </button>
+                    );
+                  };
+                  return (
+                    <div key={t.key} style={{
+                      display: "flex", alignItems: "center", gap: 8,
+                      padding: "10px 12px 10px 9px",
+                      borderTop: i === 0 ? "none" : "1px solid #e5e7eb",
+                      // Thin rule marks the tests that were actually sampled.
+                      borderLeft: `3px solid ${wasRequested ? "#007890" : "transparent"}`,
+                      background: chosen ? (chosen === "compliant" ? "#f0fdf4" : "#fef2f2") : "#fff",
+                    }}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: "0.875rem", fontWeight: 500, color: "#1f2937" }}>
+                          {t.label}
+                        </div>
+                        {(wasRequested || !chosen) && (
+                          <div style={{
+                            display: "flex", alignItems: "center", gap: 6,
+                            fontSize: "0.6875rem", marginTop: 2,
+                          }}>
+                            {wasRequested && (
+                              <span style={{
+                                display: "inline-flex", alignItems: "center", gap: 4,
+                                color: "#007890", fontWeight: 600,
+                              }}>
+                                <span style={{
+                                  width: 5, height: 5, borderRadius: "50%",
+                                  background: "#007890", display: "inline-block",
+                                }} />
+                                Sampled
+                              </span>
+                            )}
+                            {wasRequested && !chosen && <span style={{ color: "#d1d5db" }}>|</span>}
+                            {!chosen && <span style={{ color: "#9ca3af" }}>Not tested</span>}
+                          </div>
+                        )}
+                      </div>
+                      {pill("compliant", "Compliant", "#22c55e", "#16a34a")}
+                      {pill("non-compliant", "Non-Compliant", "#ef4444", "#dc2626")}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {(() => {
+              const marked = LAB_TESTS.filter(t => labResults[t.key]);
+              const anyFail = marked.some(t => labResults[t.key] === "non-compliant");
+              const ready = marked.length > 0;
+              return (
+                <div style={{ padding: "12px 16px 16px" }}>
+                  {ready ? (
+                    <div style={{
+                      padding: "9px 12px", borderRadius: 6, textAlign: "center",
+                      fontSize: "0.8125rem", fontWeight: 600,
+                      background: anyFail ? "#fef2f2" : "#f0fdf4",
+                      color: anyFail ? "#dc2626" : "#16a34a",
+                      border: `1px solid ${anyFail ? "#fecaca" : "#bbf7d0"}`,
+                    }}>
+                      Overall: {anyFail ? "Non-Compliant" : "Compliant"} — {marked.length} test{marked.length === 1 ? "" : "s"}
+                    </div>
+                  ) : (
+                    <div style={{
+                      padding: "9px 12px", borderRadius: 6,
+                      background: "#f9fafb", border: "1px solid #e5e7eb",
+                      fontSize: "0.75rem", color: "#6b7280", lineHeight: 1.5,
+                    }}>
+                      <b style={{ color: "#374151" }}>Mark at least one test to continue.</b><br />
+                      The inspection&apos;s compliance status is worked out from these
+                      results, so a COA/Lab file with nothing marked would leave it unset.
+                    </div>
+                  )}
+
+                  <div style={{ display: "flex", gap: 12, marginTop: 14 }}>
+                    <button
+                      type="button"
+                      className="ir-btn ir-btn-secondary"
+                      style={{ background: "#6b7280" }}
+                      onClick={closeLabModal}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      className="ir-btn ir-btn-primary"
+                      disabled={!ready}
+                      style={{
+                        flex: 1,
+                        background: ready ? "#007890" : "#e5e7eb",
+                        color: ready ? "#fff" : "#9ca3af",
+                        cursor: ready ? "pointer" : "not-allowed",
+                      }}
+                      onClick={handleLabResultsSubmit}
+                    >
+                      Continue to file upload
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}

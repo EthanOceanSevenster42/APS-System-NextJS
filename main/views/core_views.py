@@ -3679,6 +3679,28 @@ def upload_document(request):
             is_occurrence_report = request.POST.get('is_occurrence_report') == 'true'
             compliance_status = request.POST.get('compliance_status')  # 'compliant' or 'non-compliant'
 
+            # COA/Lab uploads carry a per-test outcome instead of one overall
+            # verdict: {"fat": "compliant", "dna": "non-compliant"}. Tests that
+            # were not assessed are absent. The overall status is derived below
+            # (non-compliant if ANY assessed test failed) so every existing
+            # badge and report keeps working unchanged.
+            _VALID_LAB_TESTS = ('fat', 'protein', 'calcium', 'dna')
+            lab_test_results = {}
+            _ltr_raw = request.POST.get('lab_test_results')
+            if _ltr_raw:
+                try:
+                    import json as _ltr_json
+                    for _k, _v in (_ltr_json.loads(_ltr_raw) or {}).items():
+                        if _k in _VALID_LAB_TESTS and _v in ('compliant', 'non-compliant'):
+                            lab_test_results[_k] = _v
+                except Exception as _e:
+                    print(f"WARNING: could not parse lab_test_results: {_e}")
+            # A per-test map wins over the legacy single value.
+            if lab_test_results:
+                compliance_status = ('non-compliant'
+                                     if any(v == 'non-compliant' for v in lab_test_results.values())
+                                     else 'compliant')
+
             # Handle NEW occurrence reports (creating a new inspection)
             if is_occurrence_report and document_type == 'occurrence' and not inspection_id and not group_id:
                 # Create a new occurrence report inspection
@@ -4551,13 +4573,23 @@ def upload_document(request):
                     elif document_type in ['lab', 'coa']:
                         inspection.coa_uploaded_by = request.user
                         inspection.coa_uploaded_date = current_time
+                        _lab_fields = ['coa_uploaded_by', 'coa_uploaded_date',
+                                       'is_direction_present_for_this_inspection']
                         # Set compliance status based on user selection
                         if compliance_status == 'non-compliant':
                             inspection.is_direction_present_for_this_inspection = True
                         elif compliance_status == 'compliant':
                             inspection.is_direction_present_for_this_inspection = False
-                        inspection.save(update_fields=['coa_uploaded_by', 'coa_uploaded_date', 'is_direction_present_for_this_inspection'])
-                        print(f"DEBUG: Updated COA/Lab tracking for individual inspection {inspection_id}, compliance: {compliance_status}")
+                        # Merge rather than replace: a later upload may report
+                        # only the test that was retested, and overwriting would
+                        # silently drop the earlier results.
+                        if lab_test_results:
+                            _merged = dict(inspection.lab_test_results or {})
+                            _merged.update(lab_test_results)
+                            inspection.lab_test_results = _merged
+                            _lab_fields.append('lab_test_results')
+                        inspection.save(update_fields=_lab_fields)
+                        print(f"DEBUG: Updated COA/Lab tracking for individual inspection {inspection_id}, compliance: {compliance_status}, tests: {lab_test_results}")
                     elif document_type == 'lab_form':
                         inspection.lab_form_uploaded_by = request.user
                         inspection.lab_form_uploaded_date = current_time
@@ -4710,6 +4742,10 @@ def upload_document(request):
                 _pcs = request.POST.get('product_compliance_status', '')
                 if _pcs:
                     log_details['compliance_status'] = _pcs
+                if lab_test_results:
+                    log_details['lab_test_results'] = lab_test_results
+                    if not _pcs:
+                        _pcs = ', '.join(f"{k}: {v}" for k, v in sorted(lab_test_results.items()))
 
                 if upload_type == 'group':
                     log_description = f"Uploaded {document_type.upper()} file '{uploaded_file.name}' for inspection group {group_id}"

@@ -68,3 +68,58 @@ def apply_filters(request, queryset):
             pass
     
     return queryset
+
+
+# ---------------------------------------------------------------------------
+#  Outstanding COAs — ONE definition, used everywhere
+# ---------------------------------------------------------------------------
+# Lab Analytics and the Analytics > Timelines backlog used to count this
+# separately and disagreed (43 vs 20): Timelines skipped Corporate Store
+# groups, Lab Analytics also accepted a Lab Form as "done" and credited a COA
+# uploaded against a duplicate client+date group. Both now call this.
+#
+# The rule, deliberately plain: a job where a sample was taken and the COA has
+# not come back yet.
+#   * counted per inspection group (one visit = one COA), not per product
+#   * a sample must have been taken - nothing to await otherwise
+#   * occurrence reports are not lab work
+#   * EGGS and POULTRY are not composition-tested, so they never await a COA
+#   * only 'coa'/'lab' documents close it. A Lab Form is the form sent TO the
+#     lab, not the result back, so it does NOT count as the COA arriving.
+#   * Corporate Store groups ARE included: the lab still owes that COA.
+
+COA_DOCUMENT_TYPES = ['coa', 'lab']
+COA_EXEMPT_COMMODITIES = ['EGGS', 'POULTRY']
+
+
+def outstanding_coa_groups(date_from=None, date_to=None, lab_keys=None, commodity=None):
+    """InspectionGroups that still owe a COA. Returns a queryset, so callers
+    can .count() it or list it."""
+    from django.db.models import Exists, OuterRef
+    from ..models import (
+        InspectionGroup as _G,
+        FoodSafetyAgencyInspection as _I,
+        InspectionDocument as _D,
+    )
+
+    awaiting = _I.objects.filter(
+        inspection_group_id=OuterRef('pk'),
+        is_sample_taken=True,
+        is_occurrence_report=False,
+    ).exclude(commodity__in=COA_EXEMPT_COMMODITIES)
+
+    if lab_keys:
+        awaiting = awaiting.filter(lab__in=lab_keys)
+    if commodity:
+        awaiting = awaiting.filter(commodity=commodity)
+
+    qs = _G.objects.filter(Exists(awaiting))
+    if date_from:
+        qs = qs.filter(date_of_inspection__gte=date_from)
+    if date_to:
+        qs = qs.filter(date_of_inspection__lte=date_to)
+
+    return qs.exclude(Exists(_D.objects.filter(
+        inspection__inspection_group_id=OuterRef('pk'),
+        document_type__in=COA_DOCUMENT_TYPES,
+    )))
