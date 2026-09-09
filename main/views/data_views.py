@@ -4468,6 +4468,461 @@ def api_restore_deleted_inspection(request):
 
 
 # ---------------------------------------------------------------------------
+#  API: Facility report (Excel) — grouped visits, expandable, compliance ratios
+# ---------------------------------------------------------------------------
+@_csrf_exempt
+@require_capability('view_org_analytics')
+def api_facility_report(request):
+    """Excel report of inspection facility groups for the current filters.
+
+    Sheet 1 uses Excel's native row outline, so every facility visit is one
+    summary row with its individual inspections collapsed underneath - click
+    the +/- in the margin to expand. The same inspections are also written
+    into a single cell on the summary row, so the report still reads without
+    expanding anything.
+    """
+    from ..models import (
+        InspectionGroup as _G,
+        FoodSafetyAgencyInspection as _I,
+        InspectionDocument as _D,
+    )
+    from django.db.models import Exists, OuterRef
+    from django.http import HttpResponse as _Resp
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    import collections as _c
+    import datetime as _dt
+
+    def _cors(r):
+        r['Access-Control-Allow-Origin'] = _get_cors_origin(request)
+        r['Access-Control-Allow-Methods'] = 'GET, OPTIONS'
+        r['Access-Control-Allow-Headers'] = 'Content-Type'
+        return r
+
+    if request.method == 'OPTIONS':
+        return _cors(JsonResponse({'ok': True}))
+
+    try:
+        # ---- same filter vocabulary as the inspections list ----------------
+        client_search = request.GET.get('client_search', '').strip()
+        date_from     = request.GET.get('date_from', '').strip()
+        date_to       = request.GET.get('date_to', '').strip()
+        inspectors    = [v for v in request.GET.getlist('inspector') if v]
+        corp_groups   = [v for v in request.GET.getlist('corporate_group') if v]
+        group_types   = [v for v in request.GET.getlist('group_type') if v]
+        commodities   = [v for v in request.GET.getlist('commodity') if v]
+
+        insp_q = _I.objects.filter(inspection_group_id=OuterRef('pk'))
+        groups = _G.objects.all()
+        if client_search:
+            groups = groups.filter(client_name__icontains=client_search)
+        if date_from:
+            groups = groups.filter(date_of_inspection__gte=date_from)
+        if date_to:
+            groups = groups.filter(date_of_inspection__lte=date_to)
+        if inspectors:
+            groups = groups.filter(inspector_name__in=inspectors)
+        if corp_groups:
+            groups = groups.filter(corporate_group__in=corp_groups)
+        if group_types:
+            groups = groups.filter(group_type__in=group_types)
+        if commodities:
+            groups = groups.filter(Exists(insp_q.filter(commodity__in=commodities)))
+
+        groups = groups.order_by('-date_of_inspection', 'client_name')
+
+        # Pull every inspection for the matched groups in one query.
+        gids = list(groups.values_list('id', flat=True))
+        rows_by_group = _c.defaultdict(list)
+        for p in _I.objects.filter(inspection_group_id__in=gids).order_by('commodity', 'id'):
+            rows_by_group[p.inspection_group_id].append(p)
+
+        # Which inspections have a compliance/composition document: without one
+        # the product was never assessed, so it must not count either way.
+        assessed_ids = set(_D.objects.filter(
+            inspection__inspection_group_id__in=gids,
+            document_type__in=['compliance', 'composition'],
+        ).values_list('inspection_id', flat=True))
+
+        def _verdict(p):
+            if p.id not in assessed_ids:
+                return 'Not assessed'
+            return 'Compliant' if p.is_product_compliant else 'Non-compliant'
+
+        # ---- house style ---------------------------------------------------
+        TEAL, TEAL_DK, INK, MUTED = '007890', '00596B', '1F2937', '6B7280'
+        BAND, GRP_BG = 'F7FAFB', 'E6F3F7'
+        GOOD, WARN, BAD = '16A34A', 'B45309', 'DC2626'
+
+        F_TITLE = Font(bold=True, size=16, color=TEAL_DK)
+        F_SUB = Font(size=9.5, color=MUTED, italic=True)
+        F_HDR = Font(bold=True, size=9.5, color='FFFFFF')
+        F_GRP = Font(bold=True, size=10, color=INK)
+        F_DET = Font(size=9, color='5B6673')
+        FILL_HDR = PatternFill('solid', fgColor=TEAL)
+        FILL_GRP = PatternFill('solid', fgColor=GRP_BG)
+        FILL_BAND = PatternFill('solid', fgColor=BAND)
+        HAIR = Side(style='hair', color='C9D6DB')
+        MED = Side(style='thin', color=TEAL)
+        B_CELL = Border(left=HAIR, right=HAIR, top=HAIR, bottom=HAIR)
+        CENTER = Alignment(horizontal='center', vertical='center')
+        WRAPC = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        LEFT = Alignment(horizontal='left', vertical='center')
+
+        filt_bits = []
+        if client_search: filt_bits.append(f'facility contains "{client_search}"')
+        if date_from or date_to:
+            filt_bits.append(f"{date_from or 'start'} to {date_to or 'today'}")
+        if inspectors: filt_bits.append(f"inspector: {', '.join(inspectors)}")
+        if corp_groups: filt_bits.append(f"group: {', '.join(corp_groups)}")
+        if group_types: filt_bits.append(f"store type: {', '.join(group_types)}")
+        if commodities: filt_bits.append(f"commodity: {', '.join(commodities)}")
+        filt_txt = '  ·  '.join(filt_bits) if filt_bits else 'No filters — all facilities'
+
+        def _sheet(ws, title, headers, widths, tab):
+            """Title block, then a styled header row on row 4."""
+            ws.sheet_properties.tabColor = tab
+            ws.sheet_view.showGridLines = False
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+            ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=len(headers))
+            t = ws.cell(row=1, column=1, value=title)
+            t.font, t.alignment = F_TITLE, LEFT
+            ws.row_dimensions[1].height = 26
+            s = ws.cell(row=2, column=1,
+                        value=f"{filt_txt}   |   generated {_dt.datetime.now():%d %b %Y %H:%M}")
+            s.font, s.alignment = F_SUB, LEFT
+            ws.row_dimensions[2].height = 14
+            ws.row_dimensions[3].height = 6
+            for c, h in enumerate(headers, 1):
+                cell = ws.cell(row=4, column=c, value=h)
+                cell.font, cell.fill, cell.alignment = F_HDR, FILL_HDR, WRAPC
+                cell.border = Border(bottom=MED)
+            ws.row_dimensions[4].height = 30
+            ws.freeze_panes = 'A5'
+            for c, w in enumerate(widths, 1):
+                ws.column_dimensions[get_column_letter(c)].width = w
+
+        def _pct_style(cell, pct):
+            """Colour a compliance percentage so problems stand out."""
+            if pct is None:
+                cell.value = '—'
+                cell.font = Font(size=9.5, color='B6BCC4')
+                cell.alignment = CENTER
+                return
+            cell.value = pct / 100.0
+            cell.number_format = '0.0%'
+            cell.alignment = CENTER
+            cell.font = Font(bold=True, size=9.5,
+                             color=GOOD if pct >= 90 else WARN if pct >= 70 else BAD)
+
+        wb = Workbook()
+
+        # ═════════════════════════════════ Sheet 1: visits, expandable
+        ws = wb.active
+        ws.title = 'Facility Visits'
+        ws.sheet_properties.outlinePr.summaryBelow = False
+        h1 = ['Facility', 'Town', 'Account Code', 'Date of Visit', 'Inspector',
+              'Commodities', 'Lines', 'Compliant', 'Non-compliant',
+              'Not assessed', 'Compliance', 'Approval', 'Inspections in this visit']
+        _sheet(ws, 'Facility Visits', h1,
+               [34, 15, 19, 13, 19, 24, 7, 10, 13, 12, 12, 12, 80], TEAL)
+
+        r, band = 5, False
+        for g in groups:
+            items = rows_by_group.get(g.id, [])
+            counts = _c.Counter(p.commodity or '(none)' for p in items)
+            commodity_txt = ', '.join(f"{k}{' ×' + str(v) if v > 1 else ''}"
+                                      for k, v in sorted(counts.items()))
+            verdicts = [_verdict(p) for p in items]
+            nc, nn, na = (verdicts.count('Compliant'), verdicts.count('Non-compliant'),
+                          verdicts.count('Not assessed'))
+            pct = round(nc * 100.0 / (nc + nn), 1) if (nc + nn) else None
+            inline = '   •   '.join(
+                f"{p.commodity or '(none)'}: {(p.product_name or '(no product)').strip()} [{_verdict(p)}]"
+                for p in items) or '(no inspection lines)'
+
+            vals = [g.client_name or '', g.town or '',
+                    (items[0].internal_account_code if items else '') or '',
+                    g.date_of_inspection, g.inspector_name or '',
+                    commodity_txt, len(items), nc, nn, na, None,
+                    (items[0].approved_status if items else '') or '', inline]
+            for c, v in enumerate(vals, 1):
+                cell = ws.cell(row=r, column=c, value=v)
+                cell.font, cell.fill, cell.border = F_GRP, FILL_GRP, B_CELL
+                if c in (4,):
+                    cell.number_format = 'dd mmm yyyy'
+                    cell.alignment = CENTER
+                elif c in (7, 8, 9, 10, 12):
+                    cell.alignment = CENTER
+                else:
+                    cell.alignment = LEFT
+            _pct_style(ws.cell(row=r, column=11), pct)
+            ws.cell(row=r, column=11).fill = FILL_GRP
+            ws.row_dimensions[r].height = 17
+            r += 1
+
+            for p in items:
+                v = _verdict(p)
+                d = [f"      ↳ {p.commodity or '(none)'}", '', '', p.date_of_inspection,
+                     p.inspector_name or '', (p.product_name or '').strip(), 1,
+                     '✓' if v == 'Compliant' else '', '✗' if v == 'Non-compliant' else '',
+                     '–' if v == 'Not assessed' else '', None, p.approved_status or '',
+                     '  |  '.join(x for x in [
+                         (p.product_class or '').strip(),
+                         'sample taken' if p.is_sample_taken else '',
+                         v] if x)]
+                for c, val in enumerate(d, 1):
+                    cell = ws.cell(row=r, column=c, value=val)
+                    cell.font, cell.border = F_DET, B_CELL
+                    if band:
+                        cell.fill = FILL_BAND
+                    if c == 4:
+                        cell.number_format = 'dd mmm yyyy'
+                        cell.alignment = CENTER
+                    elif c in (7, 8, 9, 10, 12):
+                        cell.alignment = CENTER
+                    else:
+                        cell.alignment = LEFT
+                ws.cell(row=r, column=8).font = Font(size=10, bold=True, color=GOOD)
+                ws.cell(row=r, column=9).font = Font(size=10, bold=True, color=BAD)
+                ws.cell(row=r, column=10).font = Font(size=10, color='B6BCC4')
+                ws.row_dimensions[r].outlineLevel = 1
+                ws.row_dimensions[r].hidden = True
+                r += 1
+                band = not band
+            band = False
+
+        ws.auto_filter.ref = f"A4:{get_column_letter(len(h1))}4"
+
+        # ═══════════════════ Sheet 2: compliance ratio per commodity
+        ws2 = wb.create_sheet('Compliance by Commodity')
+        h2 = ['Facility', 'Account Code', 'Commodity', 'Lines', 'Assessed',
+              'Compliant', 'Non-compliant', 'Not assessed', 'Compliance',
+              'First Visit', 'Last Visit']
+        _sheet(ws2, 'Compliance Ratio by Commodity', h2,
+               [34, 19, 15, 8, 10, 11, 14, 13, 13, 13, 13], '0F766E')
+
+        per = _c.defaultdict(lambda: {'n': 0, 'c': 0, 'nc': 0, 'na': 0,
+                                      'first': None, 'last': None, 'acct': ''})
+        for g in groups:
+            for p in rows_by_group.get(g.id, []):
+                s = per[(g.client_name or '', p.commodity or '(none)')]
+                s['n'] += 1
+                s['acct'] = s['acct'] or (p.internal_account_code or '')
+                v = _verdict(p)
+                s['c' if v == 'Compliant' else 'nc' if v == 'Non-compliant' else 'na'] += 1
+                d = p.date_of_inspection
+                if d:
+                    s['first'] = d if not s['first'] else min(s['first'], d)
+                    s['last'] = d if not s['last'] else max(s['last'], d)
+
+        r = 5
+        for (facility, commodity), s in sorted(per.items()):
+            assessed = s['c'] + s['nc']
+            pct = round(s['c'] * 100.0 / assessed, 1) if assessed else None
+            vals = [facility, s['acct'], commodity, s['n'], assessed, s['c'], s['nc'],
+                    s['na'], None, s['first'], s['last']]
+            for c, v in enumerate(vals, 1):
+                cell = ws2.cell(row=r, column=c, value=v)
+                cell.font = Font(size=9.5, color=INK)
+                cell.border = B_CELL
+                if r % 2:
+                    cell.fill = FILL_BAND
+                cell.alignment = CENTER if c in (3, 4, 5, 6, 7, 8, 10, 11) else LEFT
+                if c in (10, 11):
+                    cell.number_format = 'dd mmm yyyy'
+            ws2.cell(row=r, column=6).font = Font(size=9.5, bold=True, color=GOOD)
+            ws2.cell(row=r, column=7).font = Font(size=9.5, bold=True,
+                                                  color=BAD if s['nc'] else 'B6BCC4')
+            _pct_style(ws2.cell(row=r, column=9), pct)
+            if r % 2:
+                ws2.cell(row=r, column=9).fill = FILL_BAND
+            r += 1
+        if r > 5:
+            ws2.auto_filter.ref = f"A4:{get_column_letter(len(h2))}{r - 1}"
+
+        # ═══════════════════ Sheet 3: facility totals
+        ws3 = wb.create_sheet('Facility Summary')
+        h3 = ['Facility', 'Account Code', 'Visits', 'Lines', 'Assessed',
+              'Compliant', 'Non-compliant', 'Not assessed', 'Compliance',
+              'Commodities', 'First Visit', 'Last Visit']
+        _sheet(ws3, 'Facility Summary', h3,
+               [34, 19, 8, 8, 10, 11, 14, 13, 13, 24, 13, 13], '0369A1')
+
+        fac = _c.defaultdict(lambda: {'visits': 0, 'n': 0, 'c': 0, 'nc': 0, 'na': 0,
+                                      'first': None, 'last': None, 'acct': '',
+                                      'comms': set()})
+        for g in groups:
+            s = fac[g.client_name or '']
+            s['visits'] += 1
+            for p in rows_by_group.get(g.id, []):
+                s['n'] += 1
+                s['acct'] = s['acct'] or (p.internal_account_code or '')
+                if p.commodity:
+                    s['comms'].add(p.commodity)
+                v = _verdict(p)
+                s['c' if v == 'Compliant' else 'nc' if v == 'Non-compliant' else 'na'] += 1
+                d = p.date_of_inspection
+                if d:
+                    s['first'] = d if not s['first'] else min(s['first'], d)
+                    s['last'] = d if not s['last'] else max(s['last'], d)
+
+        r = 5
+        tot = {'visits': 0, 'n': 0, 'c': 0, 'nc': 0, 'na': 0}
+        for facility, s in sorted(fac.items(), key=lambda kv: -kv[1]['n']):
+            assessed = s['c'] + s['nc']
+            pct = round(s['c'] * 100.0 / assessed, 1) if assessed else None
+            for k in tot:
+                tot[k] += s[k]
+            vals = [facility, s['acct'], s['visits'], s['n'], assessed, s['c'], s['nc'],
+                    s['na'], None, ', '.join(sorted(s['comms'])), s['first'], s['last']]
+            for c, v in enumerate(vals, 1):
+                cell = ws3.cell(row=r, column=c, value=v)
+                cell.font = Font(size=9.5, color=INK)
+                cell.border = B_CELL
+                if r % 2:
+                    cell.fill = FILL_BAND
+                cell.alignment = CENTER if c in (3, 4, 5, 6, 7, 8, 11, 12) else LEFT
+                if c in (11, 12):
+                    cell.number_format = 'dd mmm yyyy'
+            ws3.cell(row=r, column=6).font = Font(size=9.5, bold=True, color=GOOD)
+            ws3.cell(row=r, column=7).font = Font(size=9.5, bold=True,
+                                                  color=BAD if s['nc'] else 'B6BCC4')
+            _pct_style(ws3.cell(row=r, column=9), pct)
+            if r % 2:
+                ws3.cell(row=r, column=9).fill = FILL_BAND
+            r += 1
+
+        if r > 5:
+            t_assessed = tot['c'] + tot['nc']
+            t_pct = round(tot['c'] * 100.0 / t_assessed, 1) if t_assessed else None
+            tvals = [f"TOTAL — {len(fac)} facilities", '', tot['visits'], tot['n'],
+                     t_assessed, tot['c'], tot['nc'], tot['na'], None, '', '', '']
+            for c, v in enumerate(tvals, 1):
+                cell = ws3.cell(row=r, column=c, value=v)
+                cell.font = Font(bold=True, size=10, color='FFFFFF')
+                cell.fill = PatternFill('solid', fgColor=TEAL_DK)
+                cell.alignment = CENTER if c in (3, 4, 5, 6, 7, 8) else LEFT
+            pc = ws3.cell(row=r, column=9)
+            if t_pct is not None:
+                pc.value = t_pct / 100.0
+                pc.number_format = '0.0%'
+            pc.font = Font(bold=True, size=10, color='FFFFFF')
+            pc.fill = PatternFill('solid', fgColor=TEAL_DK)
+            pc.alignment = CENTER
+            ws3.row_dimensions[r].height = 19
+            ws3.auto_filter.ref = f"A4:{get_column_letter(len(h3))}{r - 1}"
+
+        # ═══════════════════ Sheet 4: commodity matrix
+        # One row per facility, one column per commodity, so a facility's
+        # performance across commodities reads left-to-right instead of being
+        # spread over several rows.
+        ws4 = wb.create_sheet('Commodity Matrix')
+        all_comms = sorted({c for (_f, c) in per.keys()})
+        h4 = ['Facility', 'Account Code'] + all_comms + ['Overall']
+        _sheet(ws4, 'Compliance % by Commodity — facility × commodity', h4,
+               [34, 19] + [13] * len(all_comms) + [13], '7C3AED')
+
+        # facility -> commodity -> (compliant, assessed)
+        mat = _c.defaultdict(dict)
+        acct_of = {}
+        for (facility, commodity), s in per.items():
+            mat[facility][commodity] = (s['c'], s['c'] + s['nc'])
+            acct_of[facility] = acct_of.get(facility) or s['acct']
+
+        r = 5
+        for facility in sorted(mat, key=lambda f: -sum(v[1] for v in mat[f].values())):
+            ws4.cell(row=r, column=1, value=facility).alignment = LEFT
+            ws4.cell(row=r, column=2, value=acct_of.get(facility, '')).alignment = LEFT
+            for c in (1, 2):
+                cell = ws4.cell(row=r, column=c)
+                cell.font, cell.border = Font(size=9.5, color=INK), B_CELL
+                if r % 2:
+                    cell.fill = FILL_BAND
+
+            tot_c = tot_n = 0
+            for k, commodity in enumerate(all_comms):
+                col = 3 + k
+                cell = ws4.cell(row=r, column=col)
+                cell.border = B_CELL
+                if r % 2:
+                    cell.fill = FILL_BAND
+                got = mat[facility].get(commodity)
+                if not got or not got[1]:
+                    # no assessed lines for this commodity at this facility
+                    cell.value = '·' if got else ''
+                    cell.font = Font(size=9.5, color='D5DBE0')
+                    cell.alignment = CENTER
+                    continue
+                cc, nn_ = got
+                tot_c += cc
+                tot_n += nn_
+                pct = round(cc * 100.0 / nn_, 1)
+                _pct_style(cell, pct)
+                if r % 2:
+                    cell.fill = FILL_BAND
+                cell.comment = None
+
+            ocell = ws4.cell(row=r, column=len(h4))
+            ocell.border = B_CELL
+            _pct_style(ocell, round(tot_c * 100.0 / tot_n, 1) if tot_n else None)
+            if r % 2:
+                ocell.fill = FILL_BAND
+            r += 1
+
+        # commodity totals across every facility in the filter
+        if r > 5:
+            ws4.cell(row=r, column=1, value='ALL FACILITIES').font = Font(bold=True, size=10, color='FFFFFF')
+            for c in range(1, len(h4) + 1):
+                cell = ws4.cell(row=r, column=c)
+                cell.fill = PatternFill('solid', fgColor=TEAL_DK)
+                cell.alignment = CENTER if c > 1 else LEFT
+                if not cell.font.bold:
+                    cell.font = Font(bold=True, size=10, color='FFFFFF')
+            g_c = g_n = 0
+            for k, commodity in enumerate(all_comms):
+                cc = sum(v.get(commodity, (0, 0))[0] for v in mat.values())
+                nn_ = sum(v.get(commodity, (0, 0))[1] for v in mat.values())
+                g_c += cc
+                g_n += nn_
+                cell = ws4.cell(row=r, column=3 + k)
+                if nn_:
+                    cell.value = cc / nn_
+                    cell.number_format = '0.0%'
+                cell.font = Font(bold=True, size=10, color='FFFFFF')
+                cell.fill = PatternFill('solid', fgColor=TEAL_DK)
+                cell.alignment = CENTER
+            gcell = ws4.cell(row=r, column=len(h4))
+            if g_n:
+                gcell.value = g_c / g_n
+                gcell.number_format = '0.0%'
+            gcell.font = Font(bold=True, size=10, color='FFFFFF')
+            gcell.fill = PatternFill('solid', fgColor=TEAL_DK)
+            gcell.alignment = CENTER
+            ws4.row_dimensions[r].height = 19
+            ws4.auto_filter.ref = f"A4:{get_column_letter(len(h4))}{r - 1}"
+            ws4.freeze_panes = 'C5'
+
+        # ---- deliver ------------------------------------------------------
+        import io as _io
+        buf = _io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        stamp = _dt.datetime.now().strftime('%Y%m%d-%H%M')
+        name = f"Facility-Report-{client_search or 'all'}-{stamp}.xlsx".replace(' ', '-')
+        resp = _Resp(buf.read(),
+                     content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        resp['Content-Disposition'] = f'attachment; filename="{name}"'
+        return _cors(resp)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return _cors(JsonResponse({'success': False, 'error': str(e)}, status=500))
+
+
+# ---------------------------------------------------------------------------
 #  API: Export Sheet
 # ---------------------------------------------------------------------------
 @_csrf_exempt

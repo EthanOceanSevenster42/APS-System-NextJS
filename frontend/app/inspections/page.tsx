@@ -1136,6 +1136,41 @@ export default function InspectionsPage() {
     }
   }, [sendingId, showToast]);
 
+  // Facility report: same filters as the list, delivered as an .xlsx.
+  const [facilityReportBusy, setFacilityReportBusy] = useState(false);
+  const downloadFacilityReport = useCallback(async () => {
+    setFacilityReportBusy(true);
+    try {
+      const p = new URLSearchParams();
+      if (dateFrom) p.set("date_from", dateFrom);
+      if (dateTo) p.set("date_to", dateTo);
+      if (clientSearch) p.set("client_search", clientSearch);
+      appliedFilters.inspector?.forEach(v => p.append("inspector", v));
+      appliedFilters.corporateGroup?.forEach(v => p.append("corporate_group", v));
+      appliedFilters.groupType?.forEach(v => p.append("group_type", v));
+      appliedFilters.commodity?.forEach(v => p.append("commodity", v));
+
+      const res = await fetch(`/api/facility-report?${p.toString()}`, { cache: "no-store" });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        alert("Report failed: " + (err.error || res.status));
+        return;
+      }
+      const blob = await res.blob();
+      const cd = res.headers.get("content-disposition") || "";
+      const name = /filename="?([^"]+)"?/.exec(cd)?.[1] || "Facility-Report.xlsx";
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = name;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert("Report failed: " + (e instanceof Error ? e.message : String(e)));
+    } finally {
+      setFacilityReportBusy(false);
+    }
+  }, [dateFrom, dateTo, clientSearch, appliedFilters]);
+
   // Trigger file picker for a specific upload
   const triggerUpload = useCallback((inspectionId: number, groupId: string, documentType: string, productId: number, requested?: LabTest[]) => {
     // For compliance and composition uploads, show compliance status modal first
@@ -2355,6 +2390,23 @@ export default function InspectionsPage() {
                       <span style={{ background: "#fff", color: "#ef4444", borderRadius: 999, padding: "1px 7px", fontWeight: 700, marginLeft: 4, fontSize: 12 }}>{undeliverableCount}</span>
                     </button>
                   ))}
+                  {roleLoaded && !isLabTechRestricted && (
+                    <button
+                      type="button"
+                      className="ir-btn"
+                      style={{
+                        padding: "8px 16px", fontSize: 14, borderRadius: 6,
+                        background: facilityReportBusy ? "#9ca3af" : "#0f766e", color: "#fff",
+                        cursor: facilityReportBusy ? "not-allowed" : "pointer",
+                      }}
+                      onClick={downloadFacilityReport}
+                      disabled={facilityReportBusy}
+                      title="Excel report of the facilities currently filtered: one row per visit, expandable to its individual inspections, plus compliance per commodity"
+                    >
+                      <i className={facilityReportBusy ? "fas fa-spinner fa-spin" : "fas fa-file-excel"} />
+                      {facilityReportBusy ? " Building\u2026" : " Facility Report"}
+                    </button>
+                  )}
                   {roleLoaded && (isAdmin || role === "super_admin" || role === "developer") && (
                     <button type="button" className="ir-btn" style={{ padding: "8px 16px", fontSize: 14, background: "#007890", color: "#fff", borderRadius: 6 }}
                       onClick={() => {
