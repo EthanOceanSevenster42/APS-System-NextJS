@@ -25,6 +25,7 @@ const ALL_SECTIONS: NavSection[] = [
       { href: "/late-captures",  label: "Late Captures & Approvals", icon: "fas fa-user-clock"      },
       { href: "/weekly-report",  label: "Weekly Report",        icon: "fas fa-chart-line"           },
       { href: "/clients-approval/report", label: "Client Entry Report", icon: "fas fa-user-tag"     },
+      { href: "/get-app",        label: "Mobile App",           icon: "fas fa-qrcode"               },
     ],
   },
   {
@@ -48,29 +49,29 @@ const ALL_SECTIONS: NavSection[] = [
 const ROLE_ALLOWED: Record<Role, Set<string>> = {
   inspector: new Set([
     "/weekly-report", "/", "/inspections", "/analytics",
-    "/training", "/inspector-settings",
+    "/training", "/inspector-settings", "/get-app",
   ]),
   inspector_manager: new Set([
     "/weekly-report", "/", "/inspections", "/analytics", "/late-captures", "/clients-approval/report",
-    "/training", "/inspector-settings",
+    "/training", "/inspector-settings", "/get-app",
   ]),
   lab_technician: new Set([
     "/", "/inspections", "/lab-analytics",
-    "/training",
+    "/training", "/get-app",
   ]),
   admin: new Set([
-    "/weekly-report", "/", "/inspections", "/clients", "/admin-analytics", "/export-sheet", "/late-captures", "/clients-approval/report",    "/email-automation", "/training", "/settings",
+    "/weekly-report", "/", "/inspections", "/clients", "/admin-analytics", "/export-sheet", "/late-captures", "/clients-approval/report",    "/email-automation", "/training", "/settings", "/get-app",
   ]),
   financial: new Set([
-    "/", "/inspections", "/clients", "/export-sheet", "/late-captures",    "/training",
+    "/", "/inspections", "/clients", "/export-sheet", "/late-captures",    "/training", "/get-app",
   ]),
   super_admin: new Set([
     "/weekly-report", "/", "/inspections", "/clients", "/analytics", "/lab-analytics", "/export-sheet", "/late-captures", "/clients-approval/report",    "/user-management", "/email-automation", "/system-logs", "/server-view",
-    "/training", "/notifications", "/settings",
+    "/training", "/notifications", "/settings", "/get-app",
   ]),
   developer: new Set([
     "/weekly-report", "/", "/inspections", "/clients", "/analytics", "/lab-analytics", "/export-sheet", "/late-captures", "/clients-approval/report",    "/user-management", "/email-automation", "/system-logs", "/server-view",
-    "/training", "/notifications", "/settings",
+    "/training", "/notifications", "/settings", "/get-app",
   ]),
 };
 
