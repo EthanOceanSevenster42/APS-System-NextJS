@@ -1693,6 +1693,15 @@ class EmailAutomation(models.Model):
         default=False,
         help_text="Individual report: each recipient gets an email with ONLY their own numbers",
     )
+    REPORT_TYPE_CHOICES = [
+        ("full", "Full inspector-management report"),
+        ("manager", "Manager report (includes financials)"),
+        ("finance", "Finance report (no revenue figures)"),
+    ]
+    report_type = models.CharField(
+        max_length=10, choices=REPORT_TYPE_CHOICES, default="full",
+        help_text="Which weekly report PDF to attach. Ignored when per_inspector is on.",
+    )
     subject = models.CharField(max_length=255, default="Weekly Inspectorate Performance Report — {week}")
     body = models.TextField(default=(
         "Good day,\n\n"

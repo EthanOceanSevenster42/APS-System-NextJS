@@ -146,3 +146,30 @@ class InspectionAdmin(admin.ModelAdmin):
     
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('client')
+
+
+# ── Weekly report email automations ───────────────────────────────────────
+from .models import EmailAutomation, WeeklyEmailRecipient, WeeklyEmailLog  # noqa: E402
+
+
+class WeeklyEmailRecipientInline(admin.TabularInline):
+    model = WeeklyEmailRecipient
+    extra = 1
+    fields = ('email', 'name', 'active')
+
+
+@admin.register(EmailAutomation)
+class EmailAutomationAdmin(admin.ModelAdmin):
+    list_display = ('name', 'enabled', 'report_type', 'per_inspector',
+                    'schedule_type', 'send_day_of_week', 'send_hour')
+    list_filter = ('enabled', 'report_type', 'schedule_type')
+    search_fields = ('name', 'subject')
+    inlines = [WeeklyEmailRecipientInline]
+
+
+@admin.register(WeeklyEmailLog)
+class WeeklyEmailLogAdmin(admin.ModelAdmin):
+    list_display = ('run_at', 'automation_name', 'status', 'week_start', 'week_end', 'triggered_by')
+    list_filter = ('status', 'triggered_by')
+    search_fields = ('automation_name', 'recipients', 'error')
+    readonly_fields = tuple(f.name for f in WeeklyEmailLog._meta.fields)

@@ -30,6 +30,7 @@ def _automation_dict(a):
         'name': a.name,
         'enabled': a.enabled,
         'per_inspector': a.per_inspector,
+        'report_type': getattr(a, 'report_type', 'full') or 'full',
         'subject': a.subject,
         'body': a.body,
         'signature': a.signature,
@@ -87,6 +88,10 @@ def api_weekly_email_settings(request):
                     a.enabled = bool(data['enabled'])
                 if 'per_inspector' in data:
                     a.per_inspector = bool(data['per_inspector'])
+                if 'report_type' in data:
+                    rt = str(data['report_type']).strip().lower()
+                    if rt in {'full', 'manager', 'finance'}:
+                        a.report_type = rt
                 if 'name' in data:
                     name = str(data['name']).strip()[:120]
                     if name:

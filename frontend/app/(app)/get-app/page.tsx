@@ -4,8 +4,8 @@ import { useEffect, useRef, useState } from "react";
 import { QRCodeCanvas } from "@/lib/qrcodeReact";
 
 // The APK lives in /public and is served at this path.
-const APK_FILE = "/FSA-Inspector-1.0.1.2171.apk";
-const APP_VERSION = "1.0.1.2171";
+const APK_FILE = "/FSA-Inspector-1.0.1.2176.apk";
+const APP_VERSION = "1.0.1.2176";
 
 export default function GetAppPage() {
   const [apkUrl, setApkUrl] = useState("");

@@ -78,11 +78,14 @@ def _fetch_report_data(week_start, week_end):
     return data
 
 
-def _fetch_pdf(week_start, week_end, inspector=None):
+def _fetch_pdf(week_start, week_end, inspector=None, report_type=None):
     url = f"{FRONTEND_BASE}/api/weekly-report/pdf?date_from={week_start}&date_to={week_end}"
     if inspector:
         from urllib.parse import quote
         url += f"&inspector={quote(inspector)}"
+    elif report_type and report_type != 'full':
+        # ?type=manager / ?type=finance — picks which builder the frontend uses.
+        url += f"&type={report_type}"
     r = requests.get(url, headers={'X-Internal-Key': _key()}, timeout=180)
     r.raise_for_status()
     if not r.content.startswith(b'%PDF'):
@@ -259,10 +262,12 @@ def send_automation_email(automation, triggered_by='schedule', test_to=None, for
                        error=('Some failed — ' + '; '.join(failures)) if failures else '')
 
         # ── Group report: everyone gets the same full-inspectorate email ──
-        pdf = _fetch_pdf(week_start, week_end)
+        rtype = getattr(automation, 'report_type', 'full') or 'full'
+        pdf = _fetch_pdf(week_start, week_end, report_type=rtype)
         fills = _totals_fills(data, week_label)
+        label = {'manager': 'Manager-Report', 'finance': 'Finance-Report'}.get(rtype, 'Weekly-Report')
         _send_one(automation, [test_to] if test_to else [e for e, _ in rows], fills, pdf,
-                  f"Weekly-Report_{week_start}_to_{week_end}.pdf")
+                  f"{label}_{week_start}_to_{week_end}.pdf")
         return log('TEST' if test_to else 'SENT', recipients=recipients_label)
     except Exception as e:  # noqa: BLE001 — any failure must land in the log
         logger.exception('Email automation "%s" failed', automation.name)
