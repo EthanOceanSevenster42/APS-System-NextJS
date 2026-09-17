@@ -180,6 +180,9 @@ export default function UserManagementPage() {
   const [reassignTo, setReassignTo] = useState("");
   const [editUser, setEditUser] = useState<UserRecord | null>(null);
   const [resetUser, setResetUser] = useState<{ id: number; username: string; email: string } | null>(null);
+  const [resetNewPassword, setResetNewPassword] = useState("");
+  const [resetShowPassword, setResetShowPassword] = useState(false);
+  const [resetBusy, setResetBusy] = useState(false);
 
   // Add form
   const [addForm, setAddForm] = useState({
@@ -364,17 +367,62 @@ export default function UserManagementPage() {
     }
   };
 
+  // Build a password that clears Django's validators on the first try.
+  const generatePassword = () => {
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%&*";
+    const bytes = new Uint32Array(14);
+    crypto.getRandomValues(bytes);
+    const generated = Array.from(bytes, (b) => alphabet[b % alphabet.length]).join("");
+    setResetNewPassword(generated);
+    setResetShowPassword(true);
+  };
+
+  // Admin types (or generates) the new password - takes effect immediately.
+  const handleSetPassword = async () => {
+    if (!resetUser) return;
+    if (resetNewPassword.length < 8) {
+      addMessage("Password must be at least 8 characters long", "error");
+      return;
+    }
+    setResetBusy(true);
+    try {
+      const data = await postAction({
+        action: "reset_password",
+        user_id: resetUser.id,
+        new_password: resetNewPassword,
+      });
+      if (data.success) {
+        addMessage(data.message || `Password updated for ${resetUser.username}`, "success");
+        setShowResetPasswordModal(false);
+      } else {
+        addMessage(data.error || "Failed to set password", "error");
+      }
+    } finally {
+      setResetBusy(false);
+    }
+  };
+
+  // Alternative: let the user choose their own password via an emailed link.
   const handleResetPassword = async () => {
     if (!resetUser) return;
-    const data = await postAction({
-      action: "send_reset_email",
-      user_id: resetUser.id,
-    });
-    if (data.success) {
-      addMessage(data.message || "Password reset link sent", "success");
-      setShowResetPasswordModal(false);
-    } else {
-      addMessage(data.error || "Failed to send password reset link", "error");
+    if (!resetUser.email) {
+      addMessage(`${resetUser.username} has no email address on file`, "error");
+      return;
+    }
+    setResetBusy(true);
+    try {
+      const data = await postAction({
+        action: "send_reset_email",
+        user_id: resetUser.id,
+      });
+      if (data.success) {
+        addMessage(data.message || "Password reset link sent", "success");
+        setShowResetPasswordModal(false);
+      } else {
+        addMessage(data.error || "Failed to send password reset link", "error");
+      }
+    } finally {
+      setResetBusy(false);
     }
   };
 
@@ -459,6 +507,9 @@ export default function UserManagementPage() {
 
   const openResetModal = (user: UserRecord) => {
     setResetUser({ id: user.id, username: user.username, email: user.email });
+    setResetNewPassword("");
+    setResetShowPassword(false);
+    setResetBusy(false);
     setShowResetPasswordModal(true);
   };
 
@@ -829,7 +880,7 @@ export default function UserManagementPage() {
                             </button>
                             <button
                               className="um-btn um-btn-info um-action-btn"
-                              title="Set a new login password for this user"
+                              title="Set a new password for this user, or email them a reset link"
                               onClick={() => openResetModal(user)}
                             >
                               <i className="fas fa-key" /> Password
@@ -969,7 +1020,7 @@ export default function UserManagementPage() {
               <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" />
               <polyline points="22,6 12,13 2,6" />
             </svg>
-            Send Reset Email
+            Email Reset Link
           </div>
           <div
             className="um-context-menu-item"
@@ -1253,8 +1304,62 @@ export default function UserManagementPage() {
             <p style={{ fontSize: "0.875rem", color: "#6b7280", marginBottom: "1rem" }}>
               Resetting password for <strong>{resetUser.username}</strong>
             </p>
+
+            {/* Option 1 - set a password now */}
+            <div className="um-password-generate">
+              <label className="um-form-label">New Password</label>
+              <div style={{ display: "flex", gap: "0.5rem", alignItems: "flex-start" }}>
+                <div className="um-password-input-wrapper" style={{ flex: 1 }}>
+                  <input
+                    className="um-form-control"
+                    type={resetShowPassword ? "text" : "password"}
+                    value={resetNewPassword}
+                    autoComplete="new-password"
+                    placeholder="Enter a new password"
+                    style={{ paddingRight: "2.25rem" }}
+                    onChange={(e) => setResetNewPassword(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="um-password-toggle"
+                    title={resetShowPassword ? "Hide password" : "Show password"}
+                    onClick={() => setResetShowPassword((v) => !v)}
+                  >
+                    <i className={`fas ${resetShowPassword ? "fa-eye-slash" : "fa-eye"}`} />
+                  </button>
+                </div>
+                <button
+                  className="um-btn um-btn-secondary"
+                  style={{ padding: "0.5rem 0.75rem", fontSize: "0.75rem" }}
+                  onClick={generatePassword}
+                >
+                  <i className="fas fa-dice" /> Generate
+                </button>
+              </div>
+              <small style={{ color: "#6b7280", fontSize: "0.75rem", marginTop: "0.4rem", display: "block" }}>
+                Minimum 8 characters. Takes effect immediately, so remember to pass it on to the user.
+              </small>
+              <button
+                className="um-btn um-btn-primary"
+                style={{ marginTop: "0.75rem", padding: "0.5rem 1rem", fontSize: "0.8rem" }}
+                disabled={resetBusy || resetNewPassword.length < 8}
+                onClick={handleSetPassword}
+              >
+                <i className="fas fa-key" /> {resetBusy ? "Saving..." : "Set Password"}
+              </button>
+            </div>
+
+            <div className="um-password-divider">OR</div>
+
+            {/* Option 2 - let the user choose their own */}
             <div style={{ background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 6, color: "#1e3a8a", fontSize: "0.875rem", lineHeight: 1.5, padding: "0.875rem", marginBottom: "1rem" }}>
-              A secure password-reset link will be emailed to <strong>{resetUser.email || "this user's email address"}</strong>. Their current password will remain active until they choose a new one.
+              Email a secure reset link to <strong>{resetUser.email || "this user"}</strong> and let them
+              choose their own password. Their current password stays active until they do.
+              {!resetUser.email && (
+                <div style={{ color: "#b91c1c", marginTop: "0.5rem", fontWeight: 600 }}>
+                  No email address on file for this user.
+                </div>
+              )}
             </div>
 
             <div className="um-modal-actions">
@@ -1264,7 +1369,11 @@ export default function UserManagementPage() {
               >
                 Cancel
               </button>
-              <button className="um-btn um-btn-primary" onClick={handleResetPassword}>
+              <button
+                className="um-btn um-btn-primary"
+                disabled={resetBusy || !resetUser.email}
+                onClick={handleResetPassword}
+              >
                 <i className="fas fa-paper-plane" /> Send Reset Link
               </button>
             </div>

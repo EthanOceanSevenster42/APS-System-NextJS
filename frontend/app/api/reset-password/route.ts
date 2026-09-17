@@ -23,23 +23,36 @@ export async function POST(request: NextRequest) {
     }
 
     const res = await fetch(
-      `${DJANGO_API_URL}/reset-password/${uidb64}/${token}/`,
+      `${DJANGO_API_URL}/reset-password/${encodeURIComponent(uidb64)}/${encodeURIComponent(token)}/`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          // Ask Django for JSON so a rejected password is not mistaken for a
+          // success — the HTML flow answers 200/302 whatever the outcome.
+          Accept: "application/json",
+          "X-Requested-With": "XMLHttpRequest",
+        },
         body,
+        redirect: "manual",
       }
     );
 
     const text = await res.text();
-    let data;
     try {
-      data = JSON.parse(text);
+      const data = JSON.parse(text);
+      return NextResponse.json(data, { status: res.status });
     } catch {
-      data = { success: res.ok };
+      // Non-JSON means the request never reached the JSON branch (proxy error,
+      // legacy template, redirect). Never report that as a successful reset.
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Unexpected response from the server. Please try again.",
+        },
+        { status: res.ok ? 502 : res.status }
+      );
     }
-
-    return NextResponse.json(data, { status: res.status });
   } catch (e) {
     return NextResponse.json({ success: false, error: String(e) }, { status: 502 });
   }
