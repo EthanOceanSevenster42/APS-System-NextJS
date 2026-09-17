@@ -2789,7 +2789,7 @@ def api_users(request):
                 status_str = 'activated' if user.is_active else 'deactivated'
                 return _cors(JsonResponse({'success': True, 'message': f'User "{user.username}" {status_str}.', 'is_active': user.is_active}))
 
-            # ── reset_password ──
+            # ── reset_password (admin sets a new password directly) ──
             elif action == 'reset_password':
                 user_id = data.get('user_id')
                 new_password = data.get('new_password', '')
@@ -2804,8 +2804,28 @@ def api_users(request):
                 except User.DoesNotExist:
                     return _cors(JsonResponse({'success': False, 'error': f'User with id {user_id} not found.'}))
 
-                user.password = make_password(new_password)
+                from django.contrib.auth.password_validation import validate_password
+                from django.core.exceptions import ValidationError as _ValidationError
+                try:
+                    validate_password(new_password, user)
+                except _ValidationError as e:
+                    return _cors(JsonResponse({'success': False, 'error': ' '.join(e.messages)}))
+
+                user.set_password(new_password)
                 user.save()
+
+                # The account now has a usable password, so pending setup OTPs are void.
+                UserOTP.objects.filter(user=user, is_used=False).update(is_used=True)
+
+                from ..models import SystemLog
+                SystemLog.log_activity(
+                    user=request.user if request.user.is_authenticated else None,
+                    action='PASSWORD_RESET',
+                    page='user-management',
+                    object_type='user',
+                    object_id=str(user.id),
+                    description=f'Password for {user.username} was set directly by an administrator.',
+                )
 
                 return _cors(JsonResponse({'success': True, 'message': f'Password for "{user.username}" has been reset.'}))
 

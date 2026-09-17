@@ -20821,14 +20821,32 @@ def forgot_password(request):
 @csrf_exempt
 def reset_password_confirm(request, uidb64, token):
     """
-    Handle password reset confirmation (when user clicks link in email)
+    Handle password reset confirmation (when user clicks link in email).
+
+    Browsers that hit this URL directly still get the Django template; the
+    Next.js frontend proxies here asking for JSON, so it can tell a genuine
+    success from a rejected password or a dead link.
     """
     from django.shortcuts import render, redirect
     from django.contrib import messages
     from django.contrib.auth.models import User
     from django.contrib.auth.tokens import default_token_generator
+    from django.contrib.auth.password_validation import validate_password
+    from django.core.exceptions import ValidationError
     from django.utils.http import urlsafe_base64_decode
     from django.utils.encoding import force_str
+
+    wants_json = (
+        request.META.get('HTTP_X_REQUESTED_WITH') == 'XMLHttpRequest'
+        or 'application/json' in request.META.get('HTTP_ACCEPT', '')
+    )
+
+    def _fail(message, **extra):
+        """Reject the submission without losing the form the user is on."""
+        if wants_json:
+            return JsonResponse({'success': False, 'error': message, **extra}, status=400)
+        messages.error(request, message)
+        return render(request, 'main/reset_password_confirm.html')
 
     # Decode user ID from URL
     try:
@@ -20837,39 +20855,61 @@ def reset_password_confirm(request, uidb64, token):
     except (TypeError, ValueError, OverflowError, User.DoesNotExist):
         user = None
 
-    # Verify token is valid
-    if user is not None and default_token_generator.check_token(user, token):
-        # Token is valid
-        if request.method == 'POST':
-            new_password = request.POST.get('new_password')
-            confirm_password = request.POST.get('confirm_password')
-
-            # Validate passwords
-            if not new_password or not confirm_password:
-                messages.error(request, 'Both password fields are required.')
-                return render(request, 'main/reset_password_confirm.html')
-
-            if len(new_password) < 8:
-                messages.error(request, 'Password must be at least 8 characters long.')
-                return render(request, 'main/reset_password_confirm.html')
-
-            if new_password != confirm_password:
-                messages.error(request, 'Passwords do not match.')
-                return render(request, 'main/reset_password_confirm.html')
-
-            # Set new password
-            user.set_password(new_password)
-            user.save()
-
-            messages.success(request, 'Your password has been reset successfully! You can now log in with your new password.')
-            return redirect('login')
-
-        # GET request - show password reset form
-        return render(request, 'main/reset_password_confirm.html')
-    else:
-        # Invalid or expired token
-        messages.error(request, 'This password reset link is invalid or has expired. Please request a new one.')
+    # Invalid or expired token
+    if user is None or not default_token_generator.check_token(user, token):
+        msg = 'This password reset link is invalid or has expired. Please request a new one.'
+        if wants_json:
+            return JsonResponse({'success': False, 'token_invalid': True, 'error': msg}, status=400)
+        messages.error(request, msg)
         return redirect('forgot_password')
+
+    # GET request - show password reset form
+    if request.method != 'POST':
+        if wants_json:
+            return JsonResponse({'success': True, 'token_valid': True})
+        return render(request, 'main/reset_password_confirm.html')
+
+    new_password = request.POST.get('new_password') or ''
+    confirm_password = request.POST.get('confirm_password') or ''
+
+    if not new_password or not confirm_password:
+        return _fail('Both password fields are required.')
+
+    if new_password != confirm_password:
+        return _fail('Passwords do not match.')
+
+    try:
+        validate_password(new_password, user)
+    except ValidationError as e:
+        return _fail(' '.join(e.messages))
+
+    user.set_password(new_password)
+    user.save()
+
+    # A password now exists, so any outstanding setup OTP must not stay usable.
+    try:
+        from ..models import UserOTP
+        UserOTP.objects.filter(user=user, is_used=False).update(is_used=True)
+    except Exception:
+        pass
+
+    try:
+        SystemLog.log_activity(
+            user=user,
+            action='PASSWORD_RESET',
+            page='reset-password',
+            object_type='user',
+            object_id=str(user.id),
+            description=f'{user.username} completed a password reset from an emailed link.',
+        )
+    except Exception:
+        pass
+
+    if wants_json:
+        return JsonResponse({'success': True, 'message': 'Your password has been reset successfully.'})
+
+    messages.success(request, 'Your password has been reset successfully! You can now log in with your new password.')
+    return redirect('login')
 
 
 def csrf_failure(request, reason=""):
