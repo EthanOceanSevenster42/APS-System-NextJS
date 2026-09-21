@@ -38,6 +38,17 @@ SAMPLE_OVERDUE_DAYS = 7
 
 VIEW_ROLES = ('super_admin', 'developer', 'admin', 'inspector_manager', 'inspector')
 
+# Inspector-role accounts that hold the role for system access but do no field
+# work, so listing them as zero-inspection inspectors misreads as idle staff.
+# Kept out of the manager report's "2. Team Progress" roster only — their
+# inspections, if any are ever captured, still count everywhere else.
+# Requested by Nicole Bergh, 21 Sep 2026. Compared lower-cased.
+ROSTER_EXCLUDED_NAMES = frozenset({
+    'ethan sevenster',
+    'hazel sosibo',
+    'palesa mpana',
+})
+
 
 # Expected turnaround per stage, in days. Approval and COA reuse the standards
 # already applied elsewhere in this report; doc-send and invoice are a starting
@@ -405,7 +416,11 @@ def _non_inspector_names():
 def _inspector_roster():
     """Full names of everyone who SHOULD be doing inspections (inspector-role
     users), so the manager report can show inspectors who did zero work — that
-    silence is exactly what a manager needs to see, not hide."""
+    silence is exactly what a manager needs to see, not hide.
+
+    Accounts in ROSTER_EXCLUDED_NAMES are left out: they carry an inspector role
+    for access rather than to do inspections, so a zero row against their name
+    reads as an idle inspector rather than the office staff they are."""
     from django.contrib.auth import get_user_model
     User = get_user_model()
     names = []
@@ -413,7 +428,7 @@ def _inspector_roster():
     for u in User.objects.filter(role__in=['inspector', 'inspector_manager'], is_active=True):
         full = f"{u.first_name} {u.last_name}".strip() or u.username
         key = full.strip().lower()
-        if full and key not in seen:
+        if full and key not in seen and key not in ROSTER_EXCLUDED_NAMES:
             seen.add(key)
             names.append(full)
     return names
