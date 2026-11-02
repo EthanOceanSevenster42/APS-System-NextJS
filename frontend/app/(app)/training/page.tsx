@@ -1,25 +1,57 @@
 "use client";
 
+// Recorded off this system on 29 October 2026, one short clip per task.
+// The files sit beside the inspection documents, under /media/training/, so
+// nginx serves them and they need no build to replace: drop a new file of
+// the same name in that folder.
 const videos = [
   {
-    title: "System Overview",
-    description: "Learn how to navigate the FSA Management Platform",
-    icon: "fa-desktop",
+    title: "Filtering the inspection list",
+    description:
+      "Find a facility by name, narrow it to a date range, and clear the filters again.",
+    icon: "fa-filter",
+    file: "1 - How to filter the inspection list.mp4",
   },
   {
-    title: "Inspection Records",
-    description: "How to manage and upload inspection documents",
-    icon: "fa-clipboard-check",
+    title: "Approving an inspection",
+    description:
+      "The Approval column, and what the Stage column does once a job is approved.",
+    icon: "fa-check-circle",
+    file: "2 - How to approve an inspection.mp4",
   },
   {
-    title: "Client Management",
-    description: "Managing client allocations and contact details",
-    icon: "fa-users",
+    title: "Sending the report to the client",
+    description:
+      "Where the client's addresses come from, and why Send only appears after approval.",
+    icon: "fa-paper-plane",
+    file: "3 - How to send the report to the client.mp4",
   },
   {
-    title: "Export & Reporting",
-    description: "Generating export sheets and reports",
-    icon: "fa-file-export",
+    title: "Editing an inspection",
+    description: "Correcting the details on a job after it has been captured.",
+    icon: "fa-pen-to-square",
+    file: "4 - How to edit an inspection.mp4",
+  },
+  {
+    title: "Opening and uploading documents",
+    description:
+      "The folder icon: viewing, downloading and removing the documents on a job.",
+    icon: "fa-folder-open",
+    file: "5 - How to open and upload documents.mp4",
+  },
+  {
+    title: "Uploading the invoice",
+    description:
+      "The RFI, INV, COA and CMP chips, and what a red one is telling you.",
+    icon: "fa-file-invoice-dollar",
+    file: "6 - How to upload the invoice.mp4",
+  },
+  {
+    title: "Resetting your password",
+    description:
+      "Forgot Password on the sign-in screen, and the link that comes to your email.",
+    icon: "fa-key",
+    file: "7 - How to reset your password.mp4",
   },
 ];
 
@@ -39,6 +71,9 @@ export default function TrainingPage() {
 .tr-card-title-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 .tr-card-title { font-size: 1.1rem; font-weight: 600; color: #1e293b; margin: 0; }
 .tr-card-desc { color: #64748b; font-size: 0.9rem; margin: 0; line-height: 1.5; }
+.tr-video { width: 100%; display: block; background: #0f172a; aspect-ratio: 16 / 9; }
+.tr-download { display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; font-size: 0.8rem; font-weight: 600; color: #007890; text-decoration: none; }
+.tr-download:hover { text-decoration: underline; }
 
 @media (max-width: 768px) {
   .tr-container { padding: 16px 12px; }
@@ -66,7 +101,8 @@ export default function TrainingPage() {
             Training Videos
           </h1>
           <p>
-            Watch these videos to learn how to use the FSA Management Platform effectively.
+            Short clips recorded on this system, one per task. Nothing in them
+            is a live action — they show where each control is and what it does.
           </p>
         </div>
 
@@ -74,11 +110,24 @@ export default function TrainingPage() {
         <div className="tr-grid">
           {videos.map((v) => (
             <div key={v.title} className="tr-card">
-              {/* Video Placeholder */}
-              <div className="tr-video-placeholder">
-                <i className="fas fa-play-circle" style={{ fontSize: "3.5rem", color: "#94a3b8" }} />
-                <div className="tr-badge">Coming Soon</div>
-              </div>
+              {/* The clip itself. preload="none" so opening the page does
+                  not pull seven videos down a site connection — the poster
+                  frame and the controls are enough until someone presses
+                  play. */}
+              <video
+                className="tr-video"
+                controls
+                preload="none"
+                playsInline
+                src={`/media/training/${encodeURIComponent(v.file)}`}
+              />
+              <a
+                className="tr-download"
+                href={`/media/training/${encodeURIComponent(v.file)}`}
+                download
+              >
+                <i className="fas fa-download" /> Download
+              </a>
 
               {/* Card Body */}
               <div className="tr-card-body">

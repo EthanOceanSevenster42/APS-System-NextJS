@@ -26,14 +26,17 @@ interface LabData {
   testComplianceTrend?:   TestTrendRow[];
   testComplianceSummary?: Record<string, TestSummary>;
   recent:         {
-    client_name:  string;
-    product_name: string;
-    commodity:    string;
-    lab:          string;
-    needs_retest: string;
-    tests:        string[];
-    date:         string;
+    client_name:    string;
+    inspector_name: string;
+    product_name:   string;
+    commodity:      string;
+    lab:            string;
+    needs_retest:   string;
+    tests:          string[];
+    date:           string;
   }[];
+  byInspector?:   { inspector: string; n: number }[];
+  allInspectors?: string[];
 }
 
 const COMMODITY_LABEL: Record<string, string> = {
@@ -203,23 +206,27 @@ export default function LabAnalyticsPage() {
   const [dateTo, setDateTo] = useState("");
   const [labFilter, setLabFilter] = useState("");
   const [commodityFilter, setCommodityFilter] = useState("");
+  const [inspectorFilter, setInspectorFilter] = useState("");
   // Month reads best across a multi-year range; day is there when you need it.
   const [granularity, setGranularity] = useState<Granularity>("month");
   const [allLabsList, setAllLabsList] = useState<string[]>([]);
   const [allCommoditiesList, setAllCommoditiesList] = useState<string[]>([]);
+  const [allInspectorsList, setAllInspectorsList] = useState<string[]>([]);
   const [initialLoaded, setInitialLoaded] = useState(false);
 
   const [filtering, setFiltering] = useState(false);
-  const fetchData = (df?: string, dt?: string, lf?: string, cf?: string) => {
+  const fetchData = (df?: string, dt?: string, lf?: string, cf?: string, inf?: string) => {
     setLoading(true);
     setRawData(null);
     setError("");
     const p = new URLSearchParams();
     const _df = df ?? dateFrom, _dt = dt ?? dateTo, _lf = lf ?? labFilter, _cf = cf ?? commodityFilter;
+    const _inf = inf ?? inspectorFilter;
     if (_df) p.set("date_from", _df);
     if (_dt) p.set("date_to", _dt);
     if (_lf) p.set("lab", _lf);
     if (_cf) p.set("commodity", _cf);
+    if (_inf) p.set("inspector", _inf);
     const qs = p.toString();
     fetch(`/api/lab-analytics${qs ? "?" + qs : ""}`)
       .then(r => r.json())
@@ -230,6 +237,7 @@ export default function LabAnalyticsPage() {
           if (!initialLoaded) {
             if (d.allLabs) setAllLabsList(d.allLabs);
             if (d.allCommodities) setAllCommoditiesList(d.allCommodities);
+            if (d.allInspectors) setAllInspectorsList(d.allInspectors);
             setInitialLoaded(true);
           }
         }
@@ -243,7 +251,7 @@ export default function LabAnalyticsPage() {
 
   const data = rawData;
 
-  const handleReset = () => { setDateFrom(""); setDateTo(""); setLabFilter(""); setCommodityFilter(""); fetchData("", "", "", ""); };
+  const handleReset = () => { setDateFrom(""); setDateTo(""); setLabFilter(""); setCommodityFilter(""); setInspectorFilter(""); fetchData("", "", "", "", ""); };
 
   const handleExtractExcel = async () => {
     if (!data) return;
@@ -253,6 +261,7 @@ export default function LabAnalyticsPage() {
     if (dateTo) ep.set("date_to", dateTo);
     if (labFilter) ep.set("lab", labFilter);
     if (commodityFilter) ep.set("commodity", commodityFilter);
+    if (inspectorFilter) ep.set("inspector", inspectorFilter);
     ep.set("export", "1");
     let allSamples: typeof data.recent = data.recent;
     try {
@@ -617,6 +626,7 @@ export default function LabAnalyticsPage() {
 
   const allLabs = allLabsList;
   const allCommodities = allCommoditiesList;
+  const allInspectors = allInspectorsList;
 
   if (loading) return (
     <>
@@ -779,8 +789,16 @@ export default function LabAnalyticsPage() {
                   {allCommodities.map(c => <option key={c} value={c}>{COMMODITY_LABEL[c] || c}</option>)}
                 </select>
               </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 2, flex: "1 1 160px", minWidth: 160 }}>
+                <label style={{ fontSize: "0.65rem", fontWeight: 600, color: "#6b7280", textTransform: "uppercase", letterSpacing: "0.5px" }}>Inspector</label>
+                <select value={inspectorFilter} onChange={e => setInspectorFilter(e.target.value)}
+                  style={{ padding: "6px 10px", fontSize: "0.8rem", border: "1px solid #e5e7eb", borderRadius: 6, outline: "none" }}>
+                  <option value="">All Inspectors</option>
+                  {allInspectors.map(n => <option key={n} value={n}>{n}</option>)}
+                </select>
+              </div>
               <div className="la-filter-btns" style={{ display: "flex", gap: "0.5rem", flexWrap: "wrap" }}>
-                <button onClick={() => fetchData(dateFrom, dateTo, labFilter, commodityFilter)}
+                <button onClick={() => fetchData(dateFrom, dateTo, labFilter, commodityFilter, inspectorFilter)}
                   style={{ padding: "6px 14px", borderRadius: 6, border: "none", fontWeight: 500, fontSize: "0.75rem", cursor: "pointer", background: "#007890", color: "white" }}>
                   <i className="fas fa-filter" style={{ marginRight: 6 }} />Apply
                 </button>
@@ -1211,6 +1229,7 @@ export default function LabAnalyticsPage() {
                     <tr>
                       <th>Date</th>
                       <th>Client</th>
+                      <th>Inspector</th>
                       <th>Product</th>
                       <th>Commodity</th>
                       <th>Lab</th>
@@ -1225,6 +1244,7 @@ export default function LabAnalyticsPage() {
                           {r.date ? new Date(r.date + "T00:00:00").toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }) : "\u2014"}
                         </td>
                         <td style={{ fontWeight: 600, maxWidth: 180, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#1f2937" }}>{r.client_name || "\u2014"}</td>
+                        <td style={{ maxWidth: 150, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "#374151" }}>{r.inspector_name || "\u2014"}</td>
                         <td style={{ maxWidth: 140, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.product_name || "\u2014"}</td>
                         <td>
                           <span style={{ fontSize: "0.7rem", fontWeight: 600, padding: "3px 10px", borderRadius: 6, background: (COMMODITY_COLOR[r.commodity] ?? "#64748b") + "18", color: COMMODITY_COLOR[r.commodity] ?? "#64748b" }}>

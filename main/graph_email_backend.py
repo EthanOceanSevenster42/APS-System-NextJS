@@ -3,6 +3,7 @@ Microsoft Graph API Email Backend for Django
 Sends emails using Microsoft Graph API instead of SMTP
 """
 import base64
+import time
 import logging
 import json
 import mimetypes
@@ -192,7 +193,7 @@ class GraphEmailBackend(BaseEmailBackend):
             'Content-Type': 'application/json'
         }
 
-        response = requests.post(graph_url, headers=headers, json=email_data, timeout=60)
+        response = self._graph_request('POST', graph_url, headers=headers, json=email_data, timeout=60)
 
         if response.status_code == 202:
             logger.info(f"Successfully sent email (inline) to {', '.join(message.to)}")
@@ -213,11 +214,9 @@ class GraphEmailBackend(BaseEmailBackend):
 
         # Step 1: Create draft
         draft_payload = self._build_message_payload(message, content_type, content)
-        response = requests.post(
-            f"{base_url}/messages",
-            headers=headers,
-            json=draft_payload,
-            timeout=30
+        response = self._graph_request(
+            'POST', f"{base_url}/messages",
+            headers=headers, json=draft_payload, timeout=30
         )
         if response.status_code not in (200, 201):
             self._raise_graph_error(response, message, context="creating draft")
@@ -235,11 +234,9 @@ class GraphEmailBackend(BaseEmailBackend):
                     "contentType": mimetype,
                     "contentBytes": base64.b64encode(file_content).decode('utf-8')
                 }
-                r = requests.post(
-                    f"{base_url}/messages/{message_id}/attachments",
-                    headers=headers,
-                    json=attach_payload,
-                    timeout=30
+                r = self._graph_request(
+                    'POST', f"{base_url}/messages/{message_id}/attachments",
+                    headers=headers, json=attach_payload, timeout=30
                 )
                 if r.status_code not in (200, 201):
                     self._raise_graph_error(r, message, context=f"attaching {filename}")
@@ -251,10 +248,9 @@ class GraphEmailBackend(BaseEmailBackend):
                 )
 
         # Step 3: Send the draft
-        response = requests.post(
-            f"{base_url}/messages/{message_id}/send",
-            headers=headers,
-            timeout=60
+        response = self._graph_request(
+            'POST', f"{base_url}/messages/{message_id}/send",
+            headers=headers, timeout=60
         )
         if response.status_code == 202:
             logger.info(f"Successfully sent email (draft+upload) to {', '.join(message.to)}")
@@ -275,11 +271,9 @@ class GraphEmailBackend(BaseEmailBackend):
                 "contentType": mimetype
             }
         }
-        r = requests.post(
-            f"{base_url}/messages/{message_id}/attachments/createUploadSession",
-            headers=headers,
-            json=session_payload,
-            timeout=30
+        r = self._graph_request(
+            'POST', f"{base_url}/messages/{message_id}/attachments/createUploadSession",
+            headers=headers, json=session_payload, timeout=30
         )
         if r.status_code not in (200, 201):
             raise requests.exceptions.HTTPError(
@@ -302,7 +296,7 @@ class GraphEmailBackend(BaseEmailBackend):
                 'Content-Length': str(chunk_len),
                 'Content-Range': f'bytes {offset}-{end}/{file_size}'
             }
-            r = requests.put(upload_url, headers=upload_headers, data=chunk, timeout=120)
+            r = self._graph_request('PUT', upload_url, headers=upload_headers, data=chunk, timeout=120)
 
             if r.status_code not in (200, 201, 202):
                 raise requests.exceptions.HTTPError(
@@ -313,6 +307,28 @@ class GraphEmailBackend(BaseEmailBackend):
             logger.info(f"Uploaded {filename}: {min(offset, file_size)}/{file_size} bytes")
 
         logger.info(f"Large attachment {filename} uploaded successfully")
+
+    def _graph_request(self, method, url, **kwargs):
+        """Graph HTTP call that retries on throttling (429) and transient 503s,
+        honouring the Retry-After header so a short IncomingBytes/rate throttle
+        recovers on its own instead of failing the user's send."""
+        attempts = 0
+        while True:
+            resp = requests.request(method, url, **kwargs)
+            if resp.status_code not in (429, 503) or attempts >= 3:
+                return resp
+            ra = resp.headers.get('Retry-After')
+            try:
+                wait = int(ra) if ra else 0
+            except (TypeError, ValueError):
+                wait = 0
+            if wait <= 0:
+                wait = 5 * (2 ** attempts)
+            wait = min(wait, 20)
+            logger.warning("[GRAPH] throttled HTTP %s on %s; waiting %ss then retry (%s)",
+                           resp.status_code, url.rsplit('/', 1)[-1], wait, attempts + 1)
+            time.sleep(wait)
+            attempts += 1
 
     def _raise_graph_error(self, response, message, context=""):
         """Log and raise a Graph API error."""
@@ -329,6 +345,12 @@ class GraphEmailBackend(BaseEmailBackend):
             logger.error(f"[GRAPH SEND FAIL] Error code: {err_code}, message: {err_msg}")
         except Exception:
             pass
+        if response.status_code == 429:
+            raise requests.exceptions.HTTPError(
+                "Microsoft is rate-limiting email sends right now (too much data in a "
+                "short time). Please wait a few minutes and send again.",
+                response=response
+            )
         raise requests.exceptions.HTTPError(
             f"Graph API error {response.status_code} ({err_code}): {err_msg}",
             response=response

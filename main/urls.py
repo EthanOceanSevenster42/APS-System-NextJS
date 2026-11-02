@@ -47,6 +47,7 @@ from .views.weekly_email import (
 from .views.client_approval import (
     api_clients_approval, api_client_approve, api_client_merge, api_clients_approval_report,
 )
+from .views.fsa_reference_views import api_fsa_app_versions, api_fsa_reference
 from .views.data_views import (
     export_shipments, get_inspection_fees, update_inspection_fees, get_inspection_fee_history,
     api_inspections, api_clients,
@@ -57,6 +58,7 @@ from .views.data_views import (
     api_get_inspection_files,
     api_inspection_form_data,
     api_add_inspection,
+    api_update_group_approved,
     api_system_logs,
     api_facility_report,
     api_restore_deleted_inspection,
@@ -192,6 +194,10 @@ urlpatterns = [
     path('api/inspection-files/', api_get_inspection_files, name='api_get_inspection_files'),
     path('api/inspection-form-data/', api_inspection_form_data, name='api_inspection_form_data'),
     path('api/add-inspection/', api_add_inspection, name='api_add_inspection'),
+    path("api/fsa-reference/", api_fsa_reference, name="api_fsa_reference"),
+    path("api/fsa-reference/<path:subpath>", api_fsa_reference, name="api_fsa_reference_sub"),
+    path("api/fsa-app-versions/", api_fsa_app_versions, name="api_fsa_app_versions"),
+    path('api/update-group-approved/', api_update_group_approved, name='api_update_group_approved'),
     path('api/inspection-group/<int:pk>/', api_get_inspection_group, name='api_get_inspection_group'),
     path('api/edit-inspection-group/', api_edit_inspection_group, name='api_edit_inspection_group'),
     path('api/system-logs/', api_system_logs, name='api_system_logs'),

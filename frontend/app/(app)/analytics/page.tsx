@@ -34,6 +34,7 @@ interface AnalyticsData {
   inspectorPerformance: { inspector_name: string; total_inspections: number; compliant: number; non_compliant: number }[];
   occurrenceReports: { inspector_name: string; count: number }[];
   directionsPerInspector: { inspector_name: string; total: number; directions: number; non_compliant_products: number }[];
+  facilitiesPerInspector: { inspector_name: string; facilities: number; visits: number; inspections: number }[];
   travelPerInspector: { inspector_name: string; total_km: number; total_hours: number; inspection_count: number; avg_km: number }[];
   inspectorCommodityMatrix: { inspector_name: string; commodity: string; count: number }[];
   inspectorSampleMatrix: { inspector_name: string; commodity: string; count: number }[];
@@ -458,6 +459,7 @@ export default function AnalyticsPage() {
       inspectorPerformance: fi(rawData.inspectorPerformance ?? []),
       occurrenceReports: filteredOcc,
       directionsPerInspector: fi(rawData.directionsPerInspector ?? []),
+      facilitiesPerInspector: fi(rawData.facilitiesPerInspector ?? []),
       travelPerInspector: filteredTravel,
       inspectorCommodityMatrix: (rawData.inspectorCommodityMatrix ?? []).filter(r =>
         (!hasI || selInspectors.has(r.inspector_name)) && (!hasC || selCommodities.has(r.commodity))),
@@ -1944,15 +1946,19 @@ function InspectorsPanel({ data, inspectorMetric, setInspectorMetric, quarterlyT
   const allInspectors = data.filterOptions?.inspectors ?? [];
   const commodityList = ["EGG", "POULTRY", "RAW", "PMP"];
 
-  // Compute quarter date range for filtering actuals
+  // Compute quarter date range for filtering actuals. Built as YYYY-MM-DD from
+  // local calendar parts, NOT via toISOString(): toISOString() converts to UTC,
+  // so in SAST (UTC+2) the 1st of a quarter at local midnight becomes the last
+  // day of the previous quarter, shifting both boundaries a day earlier and
+  // miscounting inspections dated on a quarter edge (Ethan, 2026-10-05).
   const qStartMonth = (targetQuarter - 1) * 3; // 0-based: Q1=0, Q2=3, Q3=6, Q4=9
-  const qStart = new Date(targetYear, qStartMonth, 1);
+  const pad2 = (n: number) => String(n).padStart(2, "0");
   const qEnd = new Date(targetYear, qStartMonth + 3, 0); // last day of quarter
-  const qStartStr = qStart.toISOString().slice(0, 10);
-  const qEndStr = qEnd.toISOString().slice(0, 10);
+  const qStartStr = `${targetYear}-${pad2(qStartMonth + 1)}-01`;
+  const qEndStr = `${qEnd.getFullYear()}-${pad2(qEnd.getMonth() + 1)}-${pad2(qEnd.getDate())}`;
 
-  // Use inspectorCommodityMatrix (accurate counts from backend) but filter inspectionsList by quarter for actuals
-  // inspectorCommodityMatrix is for the full filtered period, so we use inspectionsList dates to narrow to quarter
+  // Narrow the complete inspectionsList to the selected quarter by its own
+  // date range; getActual counts these per inspector and commodity.
   const quarterInspections = (data.inspectionsList || []).filter(i => {
     const d = i.date_of_inspection || "";
     return d >= qStartStr && d <= qEndStr;
@@ -1967,20 +1973,16 @@ function InspectorsPanel({ data, inspectorMetric, setInspectorMetric, quarterlyT
     _qCounts[name][c] = (_qCounts[name][c] || 0) + 1;
   });
 
-  // If quarter matches the current data period (no top-level date filter), use the full matrix instead
-  const _hasDateFilter = false; // Top-level date filter state not accessible here; default to using matrix
-  const _useMatrix = !_hasDateFilter && targetQuarter === Math.ceil((new Date().getMonth() + 1) / 3) && targetYear === new Date().getFullYear();
-
+  // Actuals are always scoped to the selected quarter. inspectionsList is the
+  // complete set for the period (the backend does not cap it), so counting it
+  // by the quarter's own date range is accurate for every quarter — including
+  // the current one. The previous code special-cased the current quarter to the
+  // full-period commodity matrix, which made it show year-to-date (e.g. Q1+Q2+Q3
+  // under Q3) while past quarters were correct. As the calendar advances the bug
+  // simply moved to whatever quarter was current, so Q4 would have inherited it
+  // (Ethan, 2026-10-05).
   function getActual(inspector: string, commodity: string): number {
     const c = commodity === "EGG" ? "EGGS" : commodity;
-    if (_useMatrix) {
-      // Use the full commodity matrix from the API (accurate, not truncated)
-      const row = (data.inspectorCommodityMatrix || []).find(
-        (r) => r.inspector_name === inspector && r.commodity.toUpperCase() === c
-      );
-      return row?.count ?? 0;
-    }
-    // For other quarters, use the filtered inspectionsList
     return _qCounts[inspector]?.[c] || 0;
   }
 
@@ -2129,6 +2131,42 @@ function InspectorsPanel({ data, inspectorMetric, setInspectorMetric, quarterlyT
         <ChartWrap height={`${Math.max(250, inspectorTotals.length * 36)}px`}>
           <DLBar data={rankData} options={rankOpts as never} />
         </ChartWrap>
+      </Card>
+
+      <Card title="Facilities Per Inspector" icon="fas fa-store"
+        tooltip="How many distinct businesses each inspector covered, how many visits they made, and how often they returned to the same facility. Two inspectors with the same inspection count can cover very different ground.">
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead>
+              <tr style={{ background: "#f9fafb", textAlign: "left" }}>
+                <th style={{ padding: "8px 10px", fontWeight: 600, color: "#374151" }}>Inspector</th>
+                <th style={{ padding: "8px 10px", fontWeight: 600, color: "#374151", textAlign: "right" }}>Facilities</th>
+                <th style={{ padding: "8px 10px", fontWeight: 600, color: "#374151", textAlign: "right" }}>Visits</th>
+                <th style={{ padding: "8px 10px", fontWeight: 600, color: "#374151", textAlign: "right" }}>Inspections</th>
+                <th style={{ padding: "8px 10px", fontWeight: 600, color: "#374151", textAlign: "right" }}>Visits per facility</th>
+              </tr>
+            </thead>
+            <tbody>
+              {[...(data.facilitiesPerInspector || [])]
+                .sort((a, b) => b.facilities - a.facilities)
+                .map((r, i) => {
+                  const per = r.facilities > 0 ? r.visits / r.facilities : 0;
+                  return (
+                    <tr key={r.inspector_name} style={{ borderTop: "1px solid #f3f4f6", background: i % 2 ? "#fcfcfb" : "white" }}>
+                      <td style={{ padding: "8px 10px", color: "#111827" }}>{r.inspector_name}</td>
+                      <td style={{ padding: "8px 10px", textAlign: "right", fontWeight: 700, color: "#0b0b0b" }}>{r.facilities}</td>
+                      <td style={{ padding: "8px 10px", textAlign: "right", color: "#374151" }}>{r.visits}</td>
+                      <td style={{ padding: "8px 10px", textAlign: "right", color: "#374151" }}>{r.inspections}</td>
+                      <td style={{ padding: "8px 10px", textAlign: "right", color: "#52514e" }}>{per.toFixed(1)}</td>
+                    </tr>
+                  );
+                })}
+              {(data.facilitiesPerInspector || []).length === 0 && (
+                <tr><td colSpan={5} style={{ padding: "14px 10px", color: "#898781" }}>No inspections in this period.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
       </Card>
 
     </div>

@@ -32,8 +32,10 @@ const ALL_SECTIONS: NavSection[] = [
     label: "Management",
     items: [
       { href: "/user-management", label: "User Management", icon: "fas fa-user-shield" },
+      { href: "/reference-data", label: "Reference Data & Fees", icon: "fas fa-sliders-h" },
       { href: "/email-automation", label: "Weekly Email Logs", icon: "fas fa-envelope-open-text" },
       { href: "/system-logs",     label: "System Logs",     icon: "fas fa-history"     },
+      { href: "/support-tickets", label: "Support Tickets", icon: "fas fa-life-ring" },
       { href: "/training",        label: "Training",         icon: "fas fa-video"       },
     ],
   },
@@ -66,11 +68,11 @@ const ROLE_ALLOWED: Record<Role, Set<string>> = {
     "/", "/inspections", "/clients", "/export-sheet", "/late-captures",    "/training", "/get-app",
   ]),
   super_admin: new Set([
-    "/weekly-report", "/", "/inspections", "/clients", "/analytics", "/lab-analytics", "/export-sheet", "/late-captures", "/clients-approval/report",    "/user-management", "/email-automation", "/system-logs", "/server-view",
+    "/weekly-report", "/", "/inspections", "/clients", "/analytics", "/lab-analytics", "/export-sheet", "/late-captures", "/clients-approval/report",    "/reference-data", "/reference-data", "/user-management", "/email-automation", "/system-logs", "/server-view", "/support-tickets",
     "/training", "/notifications", "/settings", "/get-app",
   ]),
   developer: new Set([
-    "/weekly-report", "/", "/inspections", "/clients", "/analytics", "/lab-analytics", "/export-sheet", "/late-captures", "/clients-approval/report",    "/user-management", "/email-automation", "/system-logs", "/server-view",
+    "/weekly-report", "/", "/inspections", "/clients", "/analytics", "/lab-analytics", "/export-sheet", "/late-captures", "/clients-approval/report",    "/reference-data", "/user-management", "/email-automation", "/system-logs", "/server-view",
     "/training", "/notifications", "/settings", "/get-app",
   ]),
 };

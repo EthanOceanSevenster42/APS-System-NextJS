@@ -3398,7 +3398,7 @@ def shipment_list(request):
         'corporate_groups': filter_data.get('corporate_groups', []),
         'group_types': filter_data.get('group_types', []),
         'labs': filter_data.get('labs', []),
-        'lab_choices': dict([('lab_a', 'Food Safety Laboratory'), ('lab_b', 'Merieux NutriSciences'), ('lab_c', 'AGRI Food Laboratory (SGS)'), ('lab_d', 'SANBI'), ('lab_e', 'SMT'), ('lab_f', 'ARC')]),
+        'lab_choices': dict([('lab_a', 'Food Safety Laboratory'), ('lab_b', 'Merieux NutriSciences'), ('lab_c', 'AGRI Food Laboratory (SGS)'), ('lab_d', 'SANBI'), ('lab_e', 'SMT'), ('lab_f', 'ARC'), ('lab_g', 'Food Consulting Services (FCS)'), ('lab_h', 'AssureCloud/NOSA')]),
         'total_inspections': len(grouped_inspections),
         'total_shipments': len(grouped_inspections),  # Add this for template compatibility
         'user_role': request.user.role,
@@ -4150,26 +4150,67 @@ def upload_document(request):
                     target_inspection = None
 
             if not target_inspection and group_id:
-                # Group upload - prefer precise lookup by inspection_group PK
-                if inspection_group_pk:
-                    target_inspection = FoodSafetyAgencyInspection.objects.filter(
-                        inspection_group_id=inspection_group_pk
-                    ).first()
+                # Group upload. A group holds one inspection per product, so a
+                # per-product document (compliance, composition, lab form) must
+                # land on ITS inspection — not just the first in the group, or a
+                # multi-commodity visit files every sheet under the first
+                # product (the poultry one), the other commodities' documents
+                # are mislabelled and an egg/PMP/RAW sheet is overwritten and
+                # lost. The handset bridge sends `commodity` and `product_name`
+                # to say which inspection a document belongs to; RFI and invoice
+                # are group-level and send neither, so they still take the first
+                # (Ethan, 2026-10-06).
+                req_commodity = (request.POST.get('commodity') or '').strip()
+                req_product = (request.POST.get('product_name') or '').strip()
 
-                # Fallback to client+date parse for legacy group_id format
-                if not target_inspection:
+                base_qs = None
+                if inspection_group_pk:
+                    base_qs = FoodSafetyAgencyInspection.objects.filter(
+                        inspection_group_id=inspection_group_pk)
+                if base_qs is None or not base_qs.exists():
                     parts = group_id.split('_')
                     if len(parts) >= 2:
                         date_str = parts[-1]
                         if len(date_str) == 8:
                             try:
                                 date_obj = datetime.strptime(date_str, '%Y%m%d').date()
-                                target_inspection = FoodSafetyAgencyInspection.objects.filter(
+                                base_qs = FoodSafetyAgencyInspection.objects.filter(
                                     client_name__iexact=client_name,
-                                    date_of_inspection=date_obj
-                                ).first()
+                                    date_of_inspection=date_obj)
                             except ValueError:
-                                pass
+                                base_qs = None
+
+                if base_qs is not None:
+                    narrowed = base_qs
+                    if req_commodity:
+                        by_commodity = narrowed.filter(commodity__iexact=req_commodity)
+                        if by_commodity.exists():
+                            narrowed = by_commodity
+                    if req_product:
+                        by_product = narrowed.filter(product_name__iexact=req_product)
+                        if by_product.exists():
+                            narrowed = by_product
+                    # Where the group still holds several inspections -- a
+                    # visit with two egg records is two "EGGS/Eggs"
+                    # inspections -- the product class is what tells them
+                    # apart ("Sold as Grade 1 Large" against "...Medium"),
+                    # and it is already stored on each inspection. Zeekoegat
+                    # on 2026-10-08 had all four egg sheets on 17542 and
+                    # nothing on 17541 without it.
+                    #
+                    # Matched on the value and only when it identifies
+                    # exactly one inspection: a sheet can never be moved onto
+                    # the wrong record by this, and anything it cannot place
+                    # is left exactly where it went before (Ethan,
+                    # 2026-10-08).
+                    req_class = (request.POST.get('product_class') or '').strip()
+                    if req_class and narrowed.count() > 1:
+                        by_class = narrowed.filter(product_class__iexact=req_class)
+                        if by_class.count() == 1:
+                            narrowed = by_class
+                            print(f"[UPLOAD] Product class picked inspection "
+                                  f"{by_class.first().id}: {req_class!r}")
+                    target_inspection = narrowed.first() or base_qs.first()
 
             # Ensure inspection has a linked Client
             if target_inspection:
@@ -4285,8 +4326,43 @@ def upload_document(request):
                     clean_product = _re.sub(r'-+', '-', clean_product).strip('-')
                     if clean_product:
                         parts.append(clean_product)
+                # What tells two inspections of the same product apart --
+                # the grade and size for eggs, the designation for poultry.
+                # Both egg records on a visit are "Eggs", so without this
+                # their sheets differed by a counter alone (Ethan,
+                # 2026-10-08).
+                detail = _re.sub(r'[^a-zA-Z0-9\s\-]', '',
+                                 str(request.POST.get('product_detail') or ''))
+                detail = _re.sub(r'-+', '-',
+                                 detail.strip().replace(' ', '-')).strip('-')
+                if detail:
+                    parts.append(detail)
                 if parts:
                     commodity_tag = '-' + '-'.join(parts)
+
+            # The handset names every sheet for what it is -- "Egg Weighing
+            # Checklist", "Labelling Verification Checklist" -- and that was
+            # thrown away here, because our own label for 'compliance' is
+            # blank. A visit's four egg sheets all filed as
+            # "FSA-Zeekoegat-EGGS-Eggs-261008.pdf" with a counter after them,
+            # and the office had to open all four to find the one it wanted
+            # (Ethan, 2026-10-08). The bridge now sends the descriptive label
+            # and it is used wherever ours says nothing.
+            raw_label = _re.sub(r'[^a-zA-Z0-9\s\-]', '',
+                                str(request.POST.get('document_label') or ''))
+            raw_label = _re.sub(r'-+', '-',
+                                raw_label.strip().replace(' ', '-')).strip('-')
+            if raw_label and type_label in ('', 'OTHER'):
+                # Drop any leading word the name already carries, so it reads
+                # "EGGS-Eggs-Weighing-Checklist", not
+                # "EGGS-Eggs-Egg-Weighing-Checklist". Plurals count as the
+                # same word.
+                said = {w.upper().rstrip('S')
+                        for w in (clean_client + commodity_tag).split('-') if w}
+                words = [w for w in raw_label.split('-') if w]
+                while len(words) > 1 and words[0].upper().rstrip('S') in said:
+                    words.pop(0)
+                type_label = '-'.join(words)
 
             type_part = f"-{type_label}" if type_label else ""
             filename = f"FSA-{clean_client}{commodity_tag}{type_part}-{formatted_date}{file_extension}"
@@ -4296,28 +4372,37 @@ def upload_document(request):
             print(f"Generated filename: {filename}")
             file_path = os.path.join(document_dir, filename)
 
-            # For multi-file types (compliance, other), avoid overwriting by appending a counter
             single_file_types = ['rfi', 'invoice', 'lab', 'lab_form', 'retest', 'occurrence', 'composition']
+            # The handset sets replace_existing on the FIRST document of each
+            # kind in a re-sent batch, meaning "clear what was filed before, then
+            # add this batch". Compliance and "other" keep several files per
+            # inspection (e.g. poultry grading + labelling), so without honouring
+            # this a re-sent or corrected visit stacked the new sheets beside the
+            # old — and old mislabelled sheets were never cleared (Ethan,
+            # 2026-10-06).
+            replace_existing = str(request.POST.get('replace_existing', '')).strip().lower() in ('1', 'true', 'yes')
+
+            # Clear this inspection's folder for this category first when it is a
+            # single-file type, or when replace_existing says this is the first
+            # of its kind in the batch.
+            if document_type in single_file_types or replace_existing:
+                try:
+                    existing_files = [f for f in os.listdir(document_dir) if os.path.isfile(os.path.join(document_dir, f))]
+                    for existing_file in existing_files:
+                        os.remove(os.path.join(document_dir, existing_file))
+                    if existing_files:
+                        print(f"[REPLACE] Removed {len(existing_files)} existing file(s) in {document_dir} before saving {document_type}")
+                except Exception as e:
+                    print(f"[REPLACE] Warning: Could not clean existing files: {e}")
+
+            # For multi-file types, append a counter so several of the same kind
+            # in one batch (poultry grading + labelling) do not clobber each other.
             if document_type not in single_file_types:
                 base, ext = os.path.splitext(file_path)
                 counter = 1
                 while os.path.exists(file_path):
                     file_path = f"{base}-{counter}{ext}"
                     counter += 1
-
-            # SINGLE-FILE ENFORCEMENT: Delete existing files for document types that only allow one file
-            if document_type in single_file_types:
-                # Delete all existing files in this document folder before saving the new one
-                try:
-                    existing_files = [f for f in os.listdir(document_dir) if os.path.isfile(os.path.join(document_dir, f))]
-                    for existing_file in existing_files:
-                        existing_file_path = os.path.join(document_dir, existing_file)
-                        os.remove(existing_file_path)
-                        print(f"[SINGLE-FILE] Deleted existing file: {existing_file_path}")
-                    if existing_files:
-                        print(f"[SINGLE-FILE] Removed {len(existing_files)} existing file(s) for {document_type} - only one file allowed")
-                except Exception as e:
-                    print(f"[SINGLE-FILE] Warning: Could not clean existing files: {e}")
 
             # Save file to local storage first (for OneDrive sync)
             with open(file_path, 'wb+') as destination:
@@ -5082,7 +5167,7 @@ def list_client_folder_files(request):
         ).select_related('client')
 
         docs_base = os.path.join(settings.MEDIA_ROOT, 'docs')
-        doc_categories = ['rfi', 'invoice', 'compliance', 'composition', 'coa', 'lab', 'occurrence', 'retest', 'other']
+        doc_categories = ['rfi', 'invoice', 'compliance', 'composition', 'coa', 'lab', 'occurrence', 'retest', 'rejection', 'seizure', 'other']
 
         for inspection in inspections:
             client_obj = None
@@ -5279,7 +5364,7 @@ def list_client_folder_files(request):
                                 files_list[actual_doc_type].append(file_info)
 
         # Initialize any missing categories before returning
-        for category in ['rfi', 'invoice', 'lab', 'lab_form', 'retest', 'compliance', 'occurrence', 'composition', 'other', 'coa']:
+        for category in ['rfi', 'invoice', 'lab', 'lab_form', 'retest', 'compliance', 'occurrence', 'composition', 'rejection', 'seizure', 'other', 'coa']:
             if category not in files_list:
                 files_list[category] = []
 
@@ -10711,6 +10796,17 @@ def analytics_dashboard_api(request):
             directions=Count('id', filter=Q(is_direction_present_for_this_inspection=True)),
             non_compliant_products=Count('id', filter=Q(is_product_compliant=False)),
         ).order_by('-total')),
+        # Inspectors panel: how much ground each inspector covers. Counted
+        # on all_qs like directionsPerInspector so every inspector appears.
+        # A visit is one trip to a facility; an inspection is one product
+        # examined on that trip, so a single visit yields several rows.
+        'facilitiesPerInspector': list(all_qs.exclude(
+            Q(inspector_name__isnull=True) | Q(inspector_name='') | Q(inspector_name='Unknown') | Q(inspector_name__in=non_inspector_names)
+        ).values('inspector_name').annotate(
+            facilities=Count('client_id', distinct=True),
+            visits=Count('inspection_group_id', distinct=True),
+            inspections=Count('id'),
+        ).order_by('-facilities')),
         # Operations panel: respects inspector filter
         'travelPerInspector': _api_travel_per_inspector(group_qs, qs, non_inspector_names),
         'inspectorCommodityMatrix': list(all_qs.exclude(
@@ -12422,7 +12518,8 @@ def update_lab(request):
                 })
             
             # Validate lab value (keep in sync with model choices)
-            valid_labs = ['lab_a', 'lab_b', 'lab_c', 'lab_d', 'lab_e', 'lab_f', '']
+            valid_labs = ['lab_a', 'lab_b', 'lab_c', 'lab_d', 'lab_e', 'lab_f',
+                          'lab_g', 'lab_h', '']
             if lab not in valid_labs:
                 return JsonResponse({
                     'success': False,
@@ -14360,7 +14457,7 @@ def get_inspection_files_local(client_name, inspection_date, force_refresh=False
     from main.models import FoodSafetyAgencyInspection
 
     # Standard categories (coa removed - lab folder contains all COA/Lab files)
-    CATEGORIES = ['rfi', 'invoice', 'lab', 'lab_form', 'retest', 'compliance', 'occurrence', 'composition', 'other']
+    CATEGORIES = ['rfi', 'invoice', 'lab', 'lab_form', 'retest', 'compliance', 'occurrence', 'composition', 'rejection', 'seizure', 'other']
 
     # Initialize result
     files_by_category = {cat: [] for cat in CATEGORIES}
@@ -16076,7 +16173,7 @@ def download_all_inspection_files(request):
 
         safe_print(f"Found {all_inspections.count()} inspection(s) for docs lookup")
 
-        doc_categories = ['rfi', 'invoice', 'compliance', 'composition', 'coa', 'lab', 'lab_form', 'occurrence', 'retest', 'other']
+        doc_categories = ['rfi', 'invoice', 'compliance', 'composition', 'coa', 'lab', 'lab_form', 'occurrence', 'retest', 'rejection', 'seizure', 'other']
 
         for inspection in all_inspections:
             client_obj = None
@@ -18904,7 +19001,7 @@ def delete_notification(request, notification_id):
 
 
 @login_required
-@role_required(['super_admin', 'developer'])
+@role_required(['super_admin'])
 def fsa_operations_board(request):
     """FSA Operations Board - Dashboard for operational metrics and monitoring."""
     if not (request.user.role in ['super_admin', 'developer']):

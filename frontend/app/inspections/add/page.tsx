@@ -75,7 +75,7 @@ const PRODUCT_CLASSES_BY_COMMODITY: Record<string, string[]> = {
   POULTRY: [],
   EGGS: [],
 };
-const LABS = ["Food Safety Lab","Merieux","AGRI Food Lab","SANBI","SMT","ARC"];
+const LABS = ["Food Safety Lab","Merieux","AGRI Food Lab","SANBI","SMT","ARC","Food Consulting Services (FCS)","AssureCloud/NOSA"];
 const GROUP_TYPES = ["Corporate Store","Franchise Store","Individual / Independent Owner"];
 const FACILITY_TYPES = ["Retailer","Butchery","Re-Packer","Production Plant","Farm","Abattoir","Importer","Egg Producers"];
 
@@ -243,7 +243,7 @@ export default function AddInspectionPage() {
       if (!dateOfInspection) m.push("Date of Inspection");
       else if (dateOfInspection > new Date().toISOString().split("T")[0]) m.push("Date of Inspection cannot be in the future");
       if (!clientName.trim()) m.push("Client Name");
-      if (!town.trim()) m.push("Town");
+      if (!town.trim()) m.push("Facility Address");
       if (!primaryEmail.trim()) m.push("Client Email (Primary)");
       if (!corporateGroup.trim()) m.push("Business");
       if (!groupType.trim()) m.push("Store Type");
@@ -375,7 +375,7 @@ export default function AddInspectionPage() {
       if (!facilityType.trim()) m.push("Facility Type");
       if (!clientName.trim()) m.push("Client Name");
       if (!physicalAddress.trim()) m.push("Physical Address");
-      if (!town.trim()) m.push("Town");
+      if (!town.trim()) m.push("Facility Address");
       if (!dateOfInspection) m.push("Date of Visit");
       else if (dateOfInspection > new Date().toISOString().split("T")[0]) m.push("Date of Visit cannot be in the future");
       if (kmTraveled === undefined || kmTraveled === null) m.push("KM Traveled");
@@ -578,7 +578,7 @@ export default function AddInspectionPage() {
                   <textarea className="form-control occ-input" rows={3} value={physicalAddress} onChange={e => setPhysicalAddress(e.target.value)} placeholder="Physical address of the facility" style={{ resize: "vertical" }} />
                 </div>
 
-                <Autocomplete label="Town" required options={options?.towns ?? []} value={town} onChange={setTown} placeholder="Start typing to search towns..." />
+                <Autocomplete label="Facility Address" required options={options?.towns ?? []} value={town} onChange={setTown} placeholder="Start typing to search..." />
 
                 <div className="product-fields-grid" style={{ marginBottom: 0 }}>
                   <div className="form-group">
@@ -782,7 +782,7 @@ export default function AddInspectionPage() {
                     ["Client Name", clientName || "\u2014"],
                     ["Registration Code", registrationCode || "\u2014"],
                     ["Physical Address", physicalAddress || "\u2014"],
-                    ["Town", town || "\u2014"],
+                    ["Facility Address", town || "\u2014"],
                     ["Telephone", telephone || "\u2014"],
                     ["Client Email", primaryEmail || "\u2014"],
                   ].map(([label, val]) => (
@@ -967,7 +967,7 @@ export default function AddInspectionPage() {
               }}
               placeholder="Start typing to search clients..." />
 
-            <Autocomplete label="Town" required options={options?.towns ?? []} value={town} onChange={setTown} placeholder="Start typing to search towns..." />
+            <Autocomplete label="Facility Address" required options={options?.towns ?? []} value={town} onChange={setTown} placeholder="Start typing to search..." />
 
             <div className="form-group">
               <label className="form-label">Client Email (Primary) <span style={{ color: "#ef4444" }}>*</span></label>
@@ -1282,7 +1282,7 @@ export default function AddInspectionPage() {
                 {[
                   ["Date",            dateOfInspection ? new Date(dateOfInspection + "T00:00:00").toLocaleDateString("en-GB", { day: "2-digit", month: "long", year: "numeric" }) : "\u2014"],
                   ["Client",          clientName || "\u2014"],
-                  ["Town",            town || "\u2014"],
+                  ["Facility Address", town || "\u2014"],
                   ["Email(s)",        [primaryEmail, ...additionalEmails].filter(e => e.trim()).join('; ') || "\u2014"],
                   ["Business",        corporateGroup || "\u2014"],
                   ["Store Type",      groupType || "\u2014"],

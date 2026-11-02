@@ -176,9 +176,15 @@ def _admin_throughput(cur_start, cur_end, prev_start, prev_end):
         # Invoice uploads are stamped on the inspection (invoice_uploaded_date);
         # the 'invoice' document type is legacy and misses recent uploads — the
         # same situation as COAs (coa_uploaded_date).
+        #
+        # Counted per VISIT, not per inspection row. One invoice covers the
+        # whole visit, so counting rows said "554 invoices added" for a week
+        # that raised 88 of them — and sat beside this report's own
+        # "38 of 83 invoiced" (Ethan, 2026-11-02).
         return (FoodSafetyAgencyInspection.objects
                 .filter(invoice_uploaded_date__date__gte=a, invoice_uploaded_date__date__lte=b)
                 .exclude(inspection_group__group_type='Corporate Store')
+                .values('inspection_group_id').distinct()
                 .count())
 
     def approvals(a, b):
@@ -197,15 +203,29 @@ def _admin_throughput(cur_start, cur_end, prev_start, prev_end):
                 .count())
 
     def lab_results(a, b):
-        # Of the samples TAKEN in [a, b] (each needs a lab result), how many have
-        # a COA back. This answers "out of the X we needed this week, how many
-        # are done" — the denominator changes week to week with sample volume.
+        # Of the samples TAKEN in [a, b], how many have a COA back — counted
+        # only once the sample has had the agreed turnaround to come back.
+        #
+        # Without that cut-off the figure compared this week's samples, most
+        # still at the lab, against last week's, which had had an extra week:
+        # 44% against 94%, a "-50pt collapse" that would print every week
+        # however well the lab performed. It measured how old the samples
+        # were, not the lab (Ethan, 2026-11-02).
+        allowed = FINANCE_STAGE_TARGETS['sample_to_coa']
+        due_by = datetime.date.today() - datetime.timedelta(days=allowed)
         q = (FoodSafetyAgencyInspection.objects
              .filter(date_of_inspection__gte=a, date_of_inspection__lte=b, is_sample_taken=True)
              .exclude(inspection_group__group_type='Corporate Store'))
-        needed = q.count()
-        back = q.filter(coa_uploaded_date__isnull=False).count()
-        return {'needed': needed, 'back': back}
+        due = q.filter(date_of_inspection__lte=due_by)
+        return {
+            'needed': due.count(),
+            'back': due.filter(coa_uploaded_date__isnull=False).count(),
+            # Kept so the card can say how many of the week's samples are not
+            # old enough to judge yet, rather than silently dropping them.
+            'taken': q.count(),
+            'not_due_yet': q.count() - due.count(),
+            'allowed_days': allowed,
+        }
 
     def invoice_gaps(a, b):
         # For invoices uploaded in [a, b], the days from (i) the INSPECTION DATE
@@ -276,20 +296,15 @@ def _admin_throughput(cur_start, cur_end, prev_start, prev_end):
     # inspection AND has no COA/lab document (checked by group, or by
     # client_name + date for duplicated records). Field coa_uploaded_date alone
     # is unreliable (often blank even when a COA document exists).
-    from django.db.models import Exists, OuterRef
-    _coa_groups = InspectionGroup.objects.filter(
-        Exists(FoodSafetyAgencyInspection.objects.filter(
-            inspection_group_id=OuterRef('pk'),
-            is_sample_taken=True, is_occurrence_report=False,
-        ).exclude(commodity__in=['EGGS', 'POULTRY']))
-    )
-    _coa_doc = Exists(InspectionDocument.objects.filter(
-        Q(inspection__inspection_group_id=OuterRef('pk'))
-        | Q(inspection__client_name=OuterRef('client_name'),
-            inspection__date_of_inspection=OuterRef('date_of_inspection')),
-        document_type__in=['coa', 'lab', 'lab_form'],
-    ))
-    samples_at_lab = _coa_groups.exclude(_coa_doc).count()
+    # One definition, shared with the Lab Analytics tile and the backlog
+    # panel. It had been reimplemented here with 'lab_form' among the
+    # document types — but a lab form is raised when the sample is TAKEN,
+    # not when the result returns, so every sampled job counted as settled
+    # the moment it existed and the backlog read 2 instead of 88. It also
+    # matched documents by client name and date as well as by group, which
+    # let one job's result clear another's (Armand, 2026-10-26).
+    from .utils import outstanding_coa_groups
+    samples_at_lab = outstanding_coa_groups().count()
 
     return {
         'sent': {'count': len(cur_sent), 'prev': len(prev_sent)},
@@ -554,6 +569,124 @@ def _month_financials(month_start, month_end, excl):
     }
 
 
+def _week_financials(week_start, week_end, excl):
+    """Revenue, cost and profit per inspector for ONE week.
+
+    The same revenue formula as the monthly figures — hours, kilometres and
+    samples at the InspectionFee rates — against a week's share of salary
+    rather than a month's, so the two sides of the sum cover the same span.
+    A week is a twelfth of a year over fifty-two weeks: salary x 12 / 52.
+    """
+    fee = {f.fee_code: float(f.rate) for f in InspectionFee.objects.all()}
+    hour_rate = fee.get('inspection_hour_rate', 540.60)
+    km_rate = fee.get('inspection_km_rate', fee.get('travel_rate_per_km', 6.50))
+    sample_rate = fee.get('sample_collection', 0)
+
+    base = Q(inspector_name__isnull=True) | Q(inspector_name='') | Q(inspector_name__in=excl)
+
+    grp = {}
+    for r in InspectionGroup.objects.filter(
+        date_of_inspection__gte=week_start, date_of_inspection__lte=week_end,
+    ).exclude(base).values('inspector_name').annotate(
+        hrs=Sum('hours'), km=Sum('km_traveled'),
+    ):
+        grp[r['inspector_name']] = {'hrs': float(r['hrs'] or 0), 'km': float(r['km'] or 0)}
+
+    insp = {}
+    for r in FoodSafetyAgencyInspection.objects.filter(
+        date_of_inspection__gte=week_start, date_of_inspection__lte=week_end,
+    ).exclude(base).values('inspector_name').annotate(
+        n=Count('id'), samples=Count('id', filter=Q(is_sample_taken=True)),
+    ):
+        insp[r['inspector_name']] = {'n': r['n'], 'samples': r['samples']}
+
+    salaries = {s.inspector_name.strip().lower(): float(s.monthly_salary)
+                for s in InspectorSalary.objects.all()}
+
+    def lookup_salary(name):
+        n = name.strip().lower()
+        if n in salaries:
+            return salaries[n]
+        parts = name.split()
+        if len(parts) > 1 and parts[-1].lower() in salaries:
+            return salaries[parts[-1].lower()]
+        if parts and parts[0].lower() in salaries:
+            return salaries[parts[0].lower()]
+        return 0.0
+
+    from django.contrib.auth import get_user_model
+    _User = get_user_model()
+    active_names = set()
+    for u in _User.objects.filter(role__in=['inspector', 'inspector_manager'], is_active=True):
+        full = f"{u.first_name} {u.last_name}".strip()
+        if full:
+            active_names.add(full.lower())
+
+    first_active = {}
+    for r in FoodSafetyAgencyInspection.objects.exclude(base).values(
+        'inspector_name',
+    ).annotate(f=Min('date_of_inspection')):
+        if r['f']:
+            first_active[r['inspector_name']] = r['f']
+
+    def still_employed(name):
+        if lookup_salary(name) <= 0:
+            return False
+        if name.strip().lower() not in active_names:
+            return False
+        first = first_active.get(name)
+        return bool(first and first <= week_end)
+
+    names = set(grp) | set(insp)
+    for sal_name in FoodSafetyAgencyInspection.objects.exclude(base).values_list(
+        'inspector_name', flat=True,
+    ).distinct():
+        if sal_name and still_employed(sal_name):
+            names.add(sal_name)
+
+    rows = []
+    for name in names:
+        g = grp.get(name, {})
+        it = insp.get(name, {})
+        hrs = g.get('hrs', 0.0)
+        km = g.get('km', 0.0)
+        samples = it.get('samples', 0)
+        revenue = round(hrs * hour_rate + km * km_rate + samples * sample_rate, 2)
+        # One week of a monthly salary, plus the same 20% management fee the
+        # monthly figures carry.
+        cost = round(lookup_salary(name) * 12 / 52 * 1.20, 2)
+        rows.append({
+            'inspector_name': name,
+            'inspections': it.get('n', 0),
+            'hours': round(hrs, 1),
+            'revenue': revenue,
+            'cost': cost,
+            'profit': round(revenue - cost, 2),
+        })
+    rows.sort(key=lambda r: -r['profit'])
+    return {
+        'rows': rows,
+        'week_start': week_start.isoformat(),
+        'week_end': week_end.isoformat(),
+        'label': f"{week_start:%d %b}",
+        'total_revenue': round(sum(r['revenue'] for r in rows), 2),
+        'total_cost': round(sum(r['cost'] for r in rows), 2),
+        'total_profit': round(sum(r['profit'] for r in rows), 2),
+    }
+
+
+def _week_financials_series(week_start, week_end, excl, n=6):
+    """The last `n` completed weeks, newest first, for the week-by-week
+    profit table and the movement between one week and the next."""
+    out = []
+    ws, we = week_start, week_end
+    for _ in range(n):
+        out.append(_week_financials(ws, we, excl))
+        ws -= datetime.timedelta(days=7)
+        we -= datetime.timedelta(days=7)
+    return out
+
+
 def _month_financials_series(anchor_end, excl, n=6):
     """Revenue/cost/profit per inspector for each of the last `n` calendar
     months (newest first), each a full-month _month_financials() result. Used
@@ -579,7 +712,11 @@ def _month_financials_series(anchor_end, excl, n=6):
 # Finance/efficiency report stage targets (days). Unlike the manager report
 # (where invoice has no agreed target), Speed to Cash needs a yardstick, so each
 # stage gets a starting target the APS department can tune later.
-FINANCE_STAGE_TARGETS = {'approval': 2, 'send_docs': 3, 'invoice': 7, 'sample_to_coa': 7}
+# Days allowed for each back-office step, agreed with the Agency
+# (Ethan, 2026-11-02): documents out within 5, invoiced within 2, COA
+# back within 5. Approval unchanged at 2, the same figure ADMIN_LAG_DAYS
+# holds the capture standard to.
+FINANCE_STAGE_TARGETS = {'approval': 2, 'send_docs': 5, 'invoice': 2, 'sample_to_coa': 5}
 FINANCE_STAGE_LABELS = {
     'approval': 'Inspection to approval',
     'send_docs': 'Inspection to documents sent',
@@ -631,6 +768,9 @@ def _finance_efficiency(week_start, week_end, prev_start, prev_end):
         prev = _stage(field, extra, prev_start, prev_end)
         timeliness[key] = {
             **cur, 'prev_avg': prev['avg'], 'prev_count': prev['count'],
+            # The card reports the median; the arrow has to judge the same
+            # figure or it contradicts what is printed beside it.
+            'prev_median': prev['median'],
             'target': FINANCE_STAGE_TARGETS[key], 'label': FINANCE_STAGE_LABELS[key],
         }
 
@@ -834,6 +974,36 @@ def api_weekly_report(request):
             'rank': cur_rank[name],
             'rank_change': (prev_rank.get(name) - cur_rank[name]) if name in prev_rank else None,
         })
+    # An inspector who did nothing in the reporting week has no row in
+    # `cur`, so Team Progress fell back to an all-zero line for them —
+    # printing 0 for the month even where the month holds real work. Seun
+    # Sebolai read as 0/0/0 against 22 inspections this month, and Neo Noe
+    # against 6 (Armand, 2026-10-26). Their week really was zero; the month
+    # and the quarter were not, so those are carried through.
+    _seen = {n.strip().lower() for n in cur}
+    for name in set(monthly) | set(cumulative):
+        if name.strip().lower() in _seen:
+            continue
+        cum_r = cumulative.get(name, {})
+        cum = cum_r.get('n', 0)
+        cum_approved = cum_r.get('a', 0)
+        if not cum and not monthly.get(name):
+            continue
+        target = targets.get(name) or next(
+            (v for k, v in targets.items() if k.lower() == name.lower()), 0)
+        performance.append({
+            'inspector_name': name,
+            'quarter_target': target,
+            'weekly_inspections': 0,
+            'prev_inspections': prev.get(name, {}).get('inspections', 0),
+            'month_inspections': monthly.get(name, 0),
+            'cumulative_inspections': cum,
+            'cumulative_approved': cum_approved,
+            'cumulative_pending': cum - cum_approved,
+            'target_pct': round(cum * 100 / target) if target else None,
+            'rank': len(cur) + 1,
+            'rank_change': None,
+        })
     performance.sort(key=lambda x: x['rank'])
 
     # ── KPI target progress PER COMMODITY — for each inspector with any target
@@ -859,12 +1029,27 @@ def api_weekly_report(request):
             })
         if comms:
             tot_t = sum(x['target'] for x in comms)
-            tot_d = sum(x['done'] for x in comms)
+            # The quarter total as Team Progress counts it, NOT the sum of
+            # the four commodity cells. An inspection filed without a
+            # commodity cannot appear in any cell, so the four never added
+            # up to the inspector's real quarter and the two tables
+            # disagreed for nearly everyone — Kabelo Percy 173 against 181,
+            # Nelisa Ntoyaphi 84 against 90 (Armand, 2026-10-26). The cells
+            # still show only what is tagged; the total tells the truth.
+            tot_cell = sum(x['done'] for x in comms)
+            cum_r = cumulative.get(name) or next(
+                (v for k, v in cumulative.items() if k.lower() == name.lower()),
+                {})
+            tot_d = cum_r.get('n', tot_cell) or tot_cell
             kpi_commodity.append({
                 'inspector_name': name,
                 'commodities': comms,
                 'total_target': tot_t,
                 'total_done': tot_d,
+                # What the commodity cells account for, so a gap between
+                # this and the total is visible rather than puzzling.
+                'total_tagged': tot_cell,
+                'total_untagged': max(tot_d - tot_cell, 0),
                 'total_pct': round(tot_d * 100 / tot_t) if tot_t else None,
             })
     kpi_commodity.sort(key=lambda r: -(r['total_pct'] if r['total_pct'] is not None else -1))
@@ -1205,7 +1390,6 @@ def api_weekly_report(request):
     def _by_commodity(a, b):
         out = {}
         for r in (_week_qs(a, b, excl)
-                  .exclude(inspection_group__group_type='Corporate Store')
                   .exclude(Q(commodity__isnull=True) | Q(commodity=''))
                   .values('commodity').annotate(n=Count('id'))):
             out[r['commodity']] = r['n']
@@ -1277,6 +1461,28 @@ def api_weekly_report(request):
         full = f"{r['created_by__first_name']} {r['created_by__last_name']}".strip()
         new_facilities[full.lower()] = r['n']
 
+    # How many separate premises each inspector actually reached this week.
+    # Counted off the groups, because a group is one visit to one facility;
+    # counting inspection rows instead would multiply a single call by however
+    # many products were looked at there. Distinct, so a shop visited twice in
+    # the week counts once. Blank names are dropped rather than collapsing
+    # into one phantom facility.
+    # Across the whole team, counted once per premises however many
+    # inspectors called there. Not the sum of the per-inspector counts.
+    team_facilities = InspectionGroup.objects.filter(
+        date_of_inspection__gte=week_start, date_of_inspection__lte=week_end,
+    ).exclude(grp_excl).exclude(client_name='').values(
+        'client_name',
+    ).distinct().count()
+
+    facilities_visited = {}
+    for r in InspectionGroup.objects.filter(
+        date_of_inspection__gte=week_start, date_of_inspection__lte=week_end,
+    ).exclude(grp_excl).exclude(client_name='').values(
+        'inspector_name',
+    ).annotate(f=Count('client_name', distinct=True)):
+        facilities_visited[r['inspector_name']] = r['f']
+
     travel = []
     for r in travel_rows:
         name = r['inspector_name']
@@ -1291,6 +1497,14 @@ def api_weekly_report(request):
             'hours': round(hours, 1),
             'inspections': insp,
             'avg_km_per_inspection': round(km / insp, 1) if insp else 0,
+            'facilities': facilities_visited.get(name, 0),
+            # The week's kilometres spread over the premises reached. An
+            # average over the whole week, not the distance to any one of
+            # them, and it includes the journey home.
+            'km_per_facility': (
+                round(km / facilities_visited[name], 1)
+                if facilities_visited.get(name) else 0
+            ),
             'new_facilities': new_facilities.get(name.lower(), 0),
         })
     travel.sort(key=lambda x: (-x['km'], x['inspector_name'].lower()))
@@ -1385,6 +1599,15 @@ def api_weekly_report(request):
             'prev_overall_compliance': prev_overall_rate,
             'total_km': round(sum(t['km'] for t in travel), 1),
             'total_hours': round(sum(t['hours'] for t in travel), 1),
+            'total_facilities': team_facilities,
+            'avg_km_per_facility': (
+                round(sum(t['km'] for t in travel) / team_facilities, 1)
+                if team_facilities else 0
+            ),
+            'avg_hours_per_facility': (
+                round(sum(t['hours'] for t in travel) / team_facilities, 1)
+                if team_facilities else 0
+            ),
         },
         'turnaround': _turnaround_response,
         'throughput': _throughput,
@@ -1412,6 +1635,7 @@ def api_weekly_report(request):
         # newest month alone (used by the glance KPI + Standing Out highlights).
         'monthly_financials': _fin_series[0] if _fin_series else None,
         'monthly_financials_series': _fin_series,
+        'weekly_financials_series': _week_financials_series(week_start, week_end, excl),
         # Finance/efficiency report: Speed to Cash headline, timeliness scorecard,
         # Rand invoiced this week, and Rand still uninvoiced. MANAGEMENT-ONLY.
         'finance_efficiency': _finance_efficiency(week_start, week_end, prev_start, prev_end),

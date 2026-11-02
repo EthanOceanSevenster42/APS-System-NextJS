@@ -84,7 +84,7 @@ const PRODUCT_CLASSES_BY_COMMODITY: Record<string, string[]> = {
   EGGS: [],
 };
 
-const LABS = ["Food Safety Lab","Merieux","AGRI Food Lab","SANBI","SMT","ARC"];
+const LABS = ["Food Safety Lab","Merieux","AGRI Food Lab","SANBI","SMT","ARC","Food Consulting Services (FCS)","AssureCloud/NOSA"];
 
 const GROUP_TYPES = ["Corporate Store","Franchise Store","Individual / Independent Owner"];
 const FACILITY_TYPES = ["Retailer","Butchery","Re-Packer","Production Plant","Farm","Abattoir","Importer","Egg Producers"];
@@ -351,7 +351,7 @@ export default function EditInspectionPage() {
     if (s === 1) {
       const missing = [];
       if (!clientName.trim()) missing.push("Client Name");
-      if (!town.trim()) missing.push("Town");
+      if (!town.trim()) missing.push("Facility Address");
       if (!corporateGroup.trim()) missing.push("Business");
       if (!groupType.trim()) missing.push("Store Type");
       if (!facilityType.trim()) missing.push("Facility Type");
@@ -588,8 +588,8 @@ export default function EditInspectionPage() {
               placeholder="Start typing to search clients..."
             />
 
-            <Autocomplete label="Town" required options={options?.towns ?? []}
-              value={town} onChange={v => { console.log(`[EditPage] Town onChange — new="${v}", old="${town}"`); setTown(v); }} placeholder="Start typing to search towns..." />
+            <Autocomplete label="Facility Address" required options={options?.towns ?? []}
+              value={town} onChange={v => { console.log(`[EditPage] Town onChange — new="${v}", old="${town}"`); setTown(v); }} placeholder="Start typing to search..." />
 
             <div className="form-group">
               <label className="form-label">Client Email (Primary){!isOccurrence && <span style={{ color: "#ef4444" }}> *</span>}</label>
@@ -896,7 +896,7 @@ export default function EditInspectionPage() {
                 {[
                   ["Date",            dateOfInspection ? new Date(dateOfInspection + "T00:00:00").toLocaleDateString("en-GB", { day: "2-digit", month: "long", year: "numeric" }) : "—"],
                   ["Client",          clientName || "—"],
-                  ["Town",            town || "—"],
+                  ["Facility Address", town || "—"],
                   ["Email(s)",        [primaryEmail, ...additionalEmails].filter(e => e.trim()).join('; ') || "—"],
                   ["Business",        corporateGroup || "—"],
                   ["Store Type",      groupType || "—"],
@@ -950,17 +950,18 @@ export default function EditInspectionPage() {
             </button>
             <div style={{ display: "flex", gap: 12 }}>
               {step < maxStep && (
-                <button type="button" className="btn btn-primary" onClick={goNext}>
+                <button type="button" className="btn btn-outline" onClick={goNext}>
                   Next <i className="fas fa-arrow-right" />
                 </button>
               )}
-              {step === maxStep && (
-                <button type="button" className="btn btn-primary" onClick={handleSave} disabled={submitting}>
-                  {submitting
-                    ? <><i className="fas fa-spinner fa-spin" /> Saving...</>
-                    : <><i className="fas fa-save" /> Save Inspection</>}
-                </button>
-              )}
+              {/* Save is available on every step (Ethan, 2026-10-16): editing the
+                  visit details on step 1 can be saved without clicking through
+                  the whole wizard. handleSave posts the full form state. */}
+              <button type="button" className="btn btn-primary" onClick={handleSave} disabled={submitting}>
+                {submitting
+                  ? <><i className="fas fa-spinner fa-spin" /> Saving...</>
+                  : <><i className="fas fa-save" /> Save Inspection</>}
+              </button>
             </div>
           </div>
 

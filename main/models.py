@@ -564,6 +564,11 @@ class InspectionGroup(models.Model):
     # Flags
     is_manual = models.BooleanField(default=True, help_text="Manually created (vs synced from server)")
 
+    # Where this group was captured: 'phone' (FSA Inspector handset, filed
+    # via the bridge) or 'web' (added in APS's own Add Inspection form).
+    # Blank on legacy/seeded rows from before this was tracked (Ethan, 2026-10-16).
+    source = models.CharField(max_length=16, blank=True, default='', help_text="Capture source: phone (handset) or web (APS)")
+
     # Who captured this group in APS (null for rows created before tracking / server syncs)
     created_by = models.ForeignKey(
         'auth.User', on_delete=models.SET_NULL, blank=True, null=True,
@@ -650,9 +655,13 @@ class FoodSafetyAgencyInspection(models.Model):
                               ('lab_c', 'AGRI Food Laboratory (SGS)'),
                               ('lab_d', 'SANBI'),
                               ('lab_e', 'SMT'),
-                              ('lab_f', 'ARC')
+                              ('lab_f', 'ARC'),
+                              ('lab_g', 'Food Consulting Services (FCS)'),
+                              ('lab_h', 'AssureCloud/NOSA'),
                           ])
-    
+    internal_sample_number = models.CharField(max_length=64, blank=True, default='',
+                          help_text="Sample number generated on the handset and written on the bag")
+
     # Reference information
     remote_id = models.IntegerField(blank=True, null=True, help_text="Original ID from remote system")
     client_name = models.CharField(max_length=200, blank=True, null=True, help_text="Client name (updated from Google Sheets if match found)")

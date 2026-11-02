@@ -10,6 +10,30 @@ from django.utils.dateparse import parse_date
 from ..models import Shipment, Client
 from ..permissions import require_capability, user_can, capability_denied
 from .utils import apply_filters, clear_messages
+
+import math as _math
+
+
+def billable_hours(value):
+    """The hours an inspection bills, by the Agency's rule.
+
+    A minimum of one hour, and above that in half-hour segments -- the
+    wording on the Request for Invoice form. Anything at or under an hour
+    (including a blank, a zero, or the 0.03 a handset clock produces when a
+    record is opened and closed quickly) bills the hour; 1.2 becomes 1.5.
+
+    A negative never reaches here from the web, which refuses it outright,
+    but one arriving any other way is treated as nothing recorded rather
+    than credited back (Ethan, 2026-10-12).
+    """
+    try:
+        hours = float(value or 0)
+    except (TypeError, ValueError):
+        return 1.0
+    if hours <= 1:
+        return 1.0
+    return _math.ceil(hours * 2) / 2.0
+
 import openpyxl
 from openpyxl.styles import Font, Alignment, PatternFill
 import csv
@@ -1162,6 +1186,16 @@ def api_inspections(request):
             elif 'INSPECTION' in filter_occurrence and 'OCCURRENCE' not in filter_occurrence:
                 groups_qs = groups_qs.filter(is_occurrence_report=False)
 
+        # Source filter (PHONE / WEB) - where the inspection was captured.
+        # "WEB" is everything that is not phone: rows created before the
+        # column existed are blank, and they were all added on the website.
+        filter_source = request.GET.getlist('source')
+        if filter_source:
+            if 'PHONE' in filter_source and 'WEB' not in filter_source:
+                groups_qs = groups_qs.filter(source='phone')
+            elif 'WEB' in filter_source and 'PHONE' not in filter_source:
+                groups_qs = groups_qs.exclude(source='phone')
+
         # Sampled filter (SAMPLED / NOT_SAMPLED)
         # Checks at individual inspection level — a group shows if it has at least one matching inspection
         filter_sampled = request.GET.getlist('sampled')
@@ -1366,12 +1400,19 @@ def api_inspections(request):
         filter_has_coa = request.GET.getlist('has_coa')
         if filter_has_coa:
             # Check by group_id (reliable) OR by client_name+date (catches duplicate groups)
+            # 'lab_form' is NOT a result. It is the submission sheet
+            # raised when the sample is TAKEN, so counting it here made
+            # every sampled job look as though its COA was already back:
+            # the Lab Analytics tile said 89 awaiting and this list showed
+            # 2 (Ethan, 2026-10-26). COA_DOCUMENT_TYPES is the shared list
+            # the tile and the weekly report both use.
+            from .utils import COA_DOCUMENT_TYPES
             _coa_exists = Exists(
                 InspectionDocument.objects.filter(
                     Q(inspection__inspection_group_id=OuterRef('pk'))
                     | Q(inspection__client_name=OuterRef('client_name'),
                         inspection__date_of_inspection=OuterRef('date_of_inspection')),
-                    document_type__in=['coa', 'lab', 'lab_form']
+                    document_type__in=COA_DOCUMENT_TYPES
                 )
             )
             # Groups that have at least one non-occurrence, non-EGGS/POULTRY inspection
@@ -1384,15 +1425,16 @@ def api_inspections(request):
             if 'HAS_COA' in filter_has_coa and 'NO_COA' not in filter_has_coa:
                 groups_qs = groups_qs.filter(_coa_exists)
             elif 'NO_COA' in filter_has_coa and 'HAS_COA' not in filter_has_coa:
-                # Only show sampled inspections missing COA (has DNA/Fat/Pro/Cal tests but no lab file)
-                _has_tests = Q(dna=True) | Q(fat=True) | Q(protein=True) | Q(calcium=True)
-                _sampled = Exists(
-                    FoodSafetyAgencyInspection.objects.filter(
-                        inspection_group_id=OuterRef('pk')
-                    ).filter(_has_tests)
-                )
-                groups_qs = groups_qs.filter(_sampled)
-                groups_qs = groups_qs.exclude(_coa_exists)
+                # The same definition the Lab Analytics tile counts, so the
+                # figure on the tile and the rows behind it always agree.
+                # This list used to ask a different question twice over --
+                # "has a test flag" rather than is_sample_taken, and a COA
+                # belonging to any job at the same client and date rather
+                # than this job's own -- which is why the tile read 89 and
+                # the list 2 (Ethan, 2026-10-26).
+                from .utils import outstanding_coa_groups
+                groups_qs = groups_qs.filter(
+                    id__in=outstanding_coa_groups().values('id'))
 
         # Compliance file filter (HAS_COMP / NO_COMP)
         filter_has_compliance = request.GET.getlist('has_compliance')
@@ -1440,12 +1482,15 @@ def api_inspections(request):
         # COA uploaded status filter (COA_UPLOADED / NO_COA)
         filter_coa_uploaded = request.GET.getlist('coa_uploaded')
         if filter_coa_uploaded:
+            # Same correction as the filter above: a submission form is
+            # not a certificate of analysis.
+            from .utils import COA_DOCUMENT_TYPES as _COA_TYPES
             _coa_up_exists = Exists(
                 InspectionDocument.objects.filter(
                     Q(inspection__inspection_group_id=OuterRef('pk'))
                     | Q(inspection__client_name=OuterRef('client_name'),
                         inspection__date_of_inspection=OuterRef('date_of_inspection')),
-                    document_type__in=['coa', 'lab', 'lab_form']
+                    document_type__in=_COA_TYPES
                 )
             )
             if 'COA_UPLOADED' in filter_coa_uploaded and 'NO_COA' not in filter_coa_uploaded:
@@ -1463,6 +1508,10 @@ def api_inspections(request):
                 'FSL': 'Food Safety Laboratory', 'Food Safety Lab': 'Food Safety Laboratory',
                 'Merieux': 'Merieux NutriSciences', 'SGS': 'AGRI Food Laboratory (SGS)',
                 'SANBI': 'SANBI', 'SMT': 'SMT', 'ARC': 'ARC',
+                'lab_g': 'Food Consulting Services (FCS)',
+                'lab_h': 'AssureCloud/NOSA',
+                'FCS': 'Food Consulting Services (FCS)',
+                'AssureCloud': 'AssureCloud/NOSA',
             }
             _groups = {}
             for _k, _v in _LAB_MAP.items():
@@ -1614,7 +1663,7 @@ def api_inspections(request):
         _file_map = {}  # (insp_id_str, category) -> bool
         _FILE_CATEGORIES = {'lab', 'coa', 'composition', 'compliance',
                             'occurrence', 'retest', 'other', 'lab_form',
-                            'rfi', 'invoice'}
+                            'rfi', 'invoice', 'rejection', 'seizure'}
         # insp_id_str → set of candidate parent dir names
         _page_probe = {}
         # name_lower → list of insp_id_str needing a Client-by-name fallback
@@ -1721,6 +1770,8 @@ def api_inspections(request):
             has_lab = _gflag['lab'] or _gflag['coa']
             has_compliance = _gflag['compliance'] or _gflag['composition']
             has_lab_form = _gflag['lab_form']
+            has_rejection = _gflag['rejection']
+            has_seizure = _gflag['seizure']
             # Compliance: matches frontend badge logic
             # Product is "assessed" if it has compliance or composition file uploaded
             # NON_COMPLIANT if any product is non-compliant (with file proof)
@@ -1767,6 +1818,8 @@ def api_inspections(request):
                 if p.fat: prod['fat'] = True
                 if p.protein: prod['protein'] = True
                 if p.calcium: prod['calcium'] = True
+                if p.internal_sample_number:
+                    prod['internal_sample_number'] = p.internal_sample_number
                 if p.is_direction_present_for_this_inspection: prod['is_direction_present_for_this_inspection'] = True
                 if p.lab_test_results: prod['lab_test_results'] = p.lab_test_results
                 # Use expanded client+date flags so per-product flags match file viewer
@@ -1816,6 +1869,8 @@ def api_inspections(request):
                 'has_invoice': has_invoice,
                 'has_lab': has_lab,
                 'has_compliance': has_compliance,
+                'has_rejection': has_rejection,
+                'has_seizure': has_seizure,
                 'email': '; '.join(filter(None, [
                     g.client.email if g.client else '',
                     g.additional_email or '',
@@ -1834,6 +1889,7 @@ def api_inspections(request):
                 'has_lab_form': has_lab_form,
                 'inspection_compliance_status': _compliance_status,
                 'products': products,
+                'source': getattr(g, 'source', '') or '',
                 'created_at': g.created_at.isoformat() if g.created_at else None,
                 'capture_lag_days': _capture_lag,
                 'late_capture': _capture_lag is not None and _capture_lag > _LATE_LAG_DAYS,
@@ -3123,6 +3179,13 @@ def api_lab_analytics(request):
             'SANBI':            'SANBI',
             'SMT':              'SMT',
             'ARC':              'ARC',
+            # Added 2026-10-20: the Agency sends samples to these two,
+            # the handset has always offered them, and APS had no code
+            # for either — so they fell out of this report entirely.
+            'lab_g':            'Food Consulting Services (FCS)',
+            'lab_h':            'AssureCloud/NOSA',
+            'FCS':              'Food Consulting Services (FCS)',
+            'AssureCloud':      'AssureCloud/NOSA',
         }
         # Reverse: display name → all raw keys that map to it
         _LAB_REVERSE_KEYS: dict[str, list[str]] = {}
@@ -3134,6 +3197,9 @@ def api_lab_analytics(request):
         _date_to = request.GET.get('date_to')
         _lab_filter = request.GET.get('lab')
         _commodity_filter = request.GET.get('commodity')
+        # Which inspector submitted the sample, so a laboratory's workload
+        # can be traced back to the people behind it (Armand, 2026-10-26).
+        _inspector_filter = request.GET.get('inspector')
         if _date_from:
             base = base.filter(date_of_inspection__gte=_date_from)
         if _date_to:
@@ -3144,6 +3210,8 @@ def api_lab_analytics(request):
             base = base.filter(lab__in=_lab_keys)
         if _commodity_filter:
             base = base.filter(commodity=_commodity_filter)
+        if _inspector_filter:
+            base = base.filter(inspector_name=_inspector_filter)
 
         # Summary stats
         total_samples   = base.count()
@@ -3161,7 +3229,9 @@ def api_lab_analytics(request):
 
         # Count "Awaiting COA" at the GROUP level — matches the NO_COA filter on inspections page.
         # Groups with at least one sampled inspection (excluding EGGS/POULTRY-only groups)
-        # that have NO InspectionDocument with document_type in ['coa', 'lab', 'lab_form'].
+        # that have NO InspectionDocument of a COA_DOCUMENT_TYPES kind
+        # ('coa' or 'lab'). A 'lab_form' is the submission sheet and is
+        # deliberately NOT counted as a result.
         # Single shared definition, so this tile and the Analytics > Timelines
         # backlog can never drift apart again. See views/utils.py.
         from .utils import outstanding_coa_groups
@@ -3231,7 +3301,7 @@ def api_lab_analytics(request):
         _export = request.GET.get('export') == '1'
         _recent_base = base.order_by('-date_of_inspection')
         recent_qs = (_recent_base if _export else _recent_base[:50]).values(
-            'client_name', 'product_name', 'commodity', 'lab',
+            'client_name', 'product_name', 'commodity', 'lab', 'inspector_name',
             'needs_retest', 'fat', 'protein', 'calcium', 'dna', 'date_of_inspection'
         )
         recent = []
@@ -3239,6 +3309,7 @@ def api_lab_analytics(request):
             tests = [t for t in ['fat', 'protein', 'calcium', 'dna'] if r.get(t)]
             recent.append({
                 'client_name':    r['client_name'] or '',
+                'inspector_name': r['inspector_name'] or '',
                 'product_name':   r['product_name'] or '',
                 'commodity':      r['commodity'] or '',
                 'lab':            _LAB_DISPLAY.get(r['lab'], r['lab']) if r.get('lab') else '',
@@ -3246,6 +3317,28 @@ def api_lab_analytics(request):
                 'tests':          tests,
                 'date':           r['date_of_inspection'].isoformat() if r['date_of_inspection'] else '',
             })
+
+        # Who submitted the samples in view. Counted on the same `base`
+        # queryset as every other tile, so it answers the filters the user
+        # has applied rather than the whole table.
+        by_inspector = sorted(
+            [{'inspector': (row['inspector_name'] or 'Unknown'), 'n': row['n']}
+             for row in base.exclude(inspector_name__isnull=True)
+                            .exclude(inspector_name='')
+                            .values('inspector_name')
+                            .annotate(n=Count('id'))],
+            key=lambda x: -x['n'])
+
+        # Every inspector who has ever submitted a sample, for the filter —
+        # unfiltered, so choosing one does not empty the list it came from.
+        all_inspectors = sorted(
+            _I.objects.filter(is_sample_taken=True)
+            .exclude(inspector_name__isnull=True).exclude(inspector_name='')
+            # order_by() clears the model's default ordering: Django adds
+            # the ordering column to the SELECT, and DISTINCT then counts
+            # it, which returned one row per sample instead of per name.
+            .order_by()
+            .values_list('inspector_name', flat=True).distinct())
 
         # Daily compliance trend per test type, from the per-test COA outcome
         # captured on upload (lab_test_results). One point per day per test:
@@ -3312,6 +3405,8 @@ def api_lab_analytics(request):
             'calcium_count':   calcium_count,
             'dna_count':       dna_count,
             'labs':            labs,
+            'byInspector':     by_inspector,
+            'allInspectors':   all_inspectors,
             'commodities':     commodities,
             'allLabsStats':    all_labs_stats,
             'allCommoditiesStats': all_commodities_stats,
@@ -3385,6 +3480,24 @@ def api_login(request):
         if not username or not password:
             return _cors(JsonResponse({'success': False, 'error': 'Username and password are required.'}, status=400))
 
+        # Brute-force throttle (best-effort: any cache error is ignored so a
+        # throttle fault can never block a real login). Added 2026-10-13.
+        _xf = request.META.get('HTTP_X_FORWARDED_FOR')
+        _cip = (_xf.split(',')[0].strip() if _xf else request.META.get('REMOTE_ADDR', '')) or 'unknown'
+        _uk = 'loginfail:%s:%s' % (_cip, username.lower())
+        _ik = 'loginfail_ip:%s' % _cip
+        _lk = 'loginlock:%s:%s' % (_cip, username.lower())
+        _ilk = 'loginlock_ip:%s' % _cip
+        try:
+            from django.core.cache import caches as _caches
+            _thr = _caches['throttle']
+            if _thr.get(_lk) or _thr.get(_ilk):
+                return _cors(JsonResponse({'success': False,
+                    'error': 'Too many failed attempts. Please try again in 15 minutes.'},
+                    status=429))
+        except Exception:
+            _thr = None
+
         # Case-insensitive username lookup
         from django.contrib.auth import get_user_model, authenticate, login as _login
         _User = get_user_model()
@@ -3401,6 +3514,12 @@ def api_login(request):
             request.session['last_activity'] = timezone.now().isoformat()
             request.session['authenticated'] = True
             request.session.modified = True
+            if _thr is not None:
+                try:
+                    _thr.delete(_uk); _thr.delete(_ik)
+                    _thr.delete(_lk); _thr.delete(_ilk)
+                except Exception:
+                    pass
 
             # Log the login
             try:
@@ -3420,9 +3539,49 @@ def api_login(request):
 
             return _cors(JsonResponse({'success': True, 'username': user.username}))
         else:
+            if _thr is not None:
+                try:
+                    _uf = (_thr.get(_uk) or 0) + 1
+                    _thr.set(_uk, _uf, 900)
+                    if _uf >= 10:
+                        _thr.set(_lk, True, 900)
+                    _if = (_thr.get(_ik) or 0) + 1
+                    _thr.set(_ik, _if, 900)
+                    if _if >= 40:
+                        _thr.set(_ilk, True, 900)
+                except Exception:
+                    pass
             return _cors(JsonResponse({'success': False, 'error': 'Invalid username or password.'}, status=401))
     except Exception as e:
         return _cors(JsonResponse({'success': False, 'error': str(e)}, status=500))
+
+
+def _inspector_visible_group_ids(request):
+    """Group ids an 'inspector' user may see; None = unrestricted (all other roles).
+
+    Mirrors the per-inspector scoping api_inspections already applies: an
+    inspector sees groups filed under their own name or their mapped
+    inspector_id, plus corporate-store groups (visible to everyone). Used to
+    enforce object-level authorization on the file endpoints so an inspector
+    cannot read another client's documents by guessing ids (Ethan, 2026-10-16).
+    """
+    from django.db.models import Q as _Q
+    from ..models import InspectorMapping, FoodSafetyAgencyInspection, InspectionGroup
+    user = getattr(request, 'user', None)
+    if not (user and getattr(user, 'is_authenticated', False)):
+        return set()
+    if getattr(user, 'role', None) != 'inspector':
+        return None
+    name = (user.get_full_name() or user.username or '').strip()
+    q = _Q(inspector_name__iexact=name) | _Q(group_type__in=['Corporate Store', 'Corporate'])
+    mapping = (InspectorMapping.objects.filter(inspector_name__iexact=name).first()
+               or InspectorMapping.objects.filter(inspector_name__iexact=user.username).first())
+    if mapping and getattr(mapping, 'inspector_id', None):
+        gids = FoodSafetyAgencyInspection.objects.filter(
+            inspector_id=mapping.inspector_id
+        ).values_list('inspection_group_id', flat=True)
+        q = q | _Q(id__in=list(gids))
+    return set(InspectionGroup.objects.filter(q).values_list('id', flat=True))
 
 
 @_csrf_exempt
@@ -3460,6 +3619,25 @@ def api_get_inspection_files(request):
             inspection_date = inspection_date.replace('\\u002D', '-')
             inspection_date = inspection_date.replace('\\u002F', '/')
             inspection_date = inspection_date.replace('\\u0020', ' ')
+
+        # Object-level authorization: an inspector may only list files for an
+        # inspection they can see; other roles are unrestricted. (Ethan, 2026-10-16)
+        _allowed = _inspector_visible_group_ids(request)
+        if _allowed is not None:
+            from ..models import InspectionGroup as _IG
+            _ok = False
+            if group_id and str(group_id).isdigit():
+                _ok = int(group_id) in _allowed
+            if not _ok and client_name:
+                _req_ids = set(_IG.objects.filter(client_name__iexact=client_name)
+                               .values_list('id', flat=True))
+                _ok = bool(_req_ids & _allowed)
+            if not _ok:
+                _empty = {'rfi': [], 'invoice': [], 'lab': [], 'lab_form': [],
+                          'retest': [], 'compliance': [], 'occurrence': [],
+                          'composition': [], 'other': []}
+                return _cors(JsonResponse({'success': True, 'files': _empty,
+                    'client_name': client_name, 'inspection_date': inspection_date}))
 
         local_files = get_inspection_files_local(client_name, inspection_date, False)
 
@@ -3518,6 +3696,21 @@ def api_serve_file(request):
 
     if not os.path.isfile(file_path):
         raise Http404(f'File not found: {safe_path}')
+
+    # Object-level authorization: an inspector may only read files belonging to
+    # an inspection they can see; other roles are unrestricted. A missing/foreign
+    # file returns 404 (not 403) so existence is not confirmed. (Ethan, 2026-10-16)
+    import re as _re_auth
+    _allowed = _inspector_visible_group_ids(request)
+    if _allowed is not None:
+        _m = _re_auth.search(r'docs[\\/]\d+[\\/](\d+)[\\/]', safe_path)
+        _gid = None
+        if _m:
+            from ..models import FoodSafetyAgencyInspection as _FSI
+            _gid = (_FSI.objects.filter(id=int(_m.group(1)))
+                    .values_list('inspection_group_id', flat=True).first())
+        if _gid is None or _gid not in _allowed:
+            raise Http404('File not found')
 
     mime_type, _ = mimetypes.guess_type(file_path)
     mime_type = mime_type or 'application/octet-stream'
@@ -3943,8 +4136,46 @@ def api_add_inspection(request):
                 except Exception:
                     return None
 
+            # The time the inspection actually ran, as distinct from the
+            # hours it bills -- those carry the one-hour minimum and the
+            # half-hour segments. These columns have existed since the
+            # beginning and nothing has ever filled them
+            # (Ethan, 2026-10-12).
+            _insp_start = _parse_hhmm(data.get('start_of_inspection')) if data.get('start_of_inspection') else None
+            _insp_end = _parse_hhmm(data.get('end_of_inspection')) if data.get('end_of_inspection') else None
             _travel_start = _parse_hhmm(data.get('travel_start_time')) if data.get('travel_start_time') else None
             _travel_end = _parse_hhmm(data.get('travel_end_time')) if data.get('travel_end_time') else None
+
+            # Duplicate guard (any source): one visit = one group. Serialise
+            # concurrent identical submissions for this client+date+inspector and,
+            # if a group with the same product signature already exists, return it
+            # instead of filing a second copy. Belt-and-suspenders for the handset
+            # race (also locked in the bridge) and for a web double-submit. Edits
+            # never reach here -- they go to /api/edit-inspection-group/.
+            # (Ethan, 2026-10-16)
+            if not is_occurrence and products_data:
+                from django.db import connection as _dup_conn
+                _dup_key = f"{client_name.lower()}|{date_obj.isoformat()}|{(inspector_name or '').strip().lower()}"
+                with _dup_conn.cursor() as _dup_cur:
+                    _dup_cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", [_dup_key])
+                _incoming_sig = tuple(sorted(
+                    ((p.get('commodity') or '').strip(), (p.get('product_name') or '').strip())
+                    for p in products_data))
+                for _cg in _Group.objects.filter(
+                        client_name__iexact=client_name,
+                        date_of_inspection=date_obj,
+                        inspector_name__iexact=(inspector_name or ''),
+                ).prefetch_related('inspections'):
+                    _existing_sig = tuple(sorted(
+                        ((_i.commodity or '').strip(), (_i.product_name or '').strip())
+                        for _i in _cg.inspections.all()))
+                    if _existing_sig and _existing_sig == _incoming_sig:
+                        return _cors(JsonResponse({
+                            'success': True,
+                            'duplicate': True,
+                            'group_id': _cg.id,
+                            'message': 'This inspection is already filed; returning the existing record.',
+                        }))
 
             # Create parent InspectionGroup
             parent_group = _Group.objects.create(
@@ -3959,10 +4190,14 @@ def api_add_inspection(request):
                 additional_email=data.get('additional_email', ''),
                 comment=data.get('comment', ''),
                 km_traveled=float(data.get('km_traveled', 0) or 0),
-                hours=float(data.get('hours', 0) or 0),
+                hours=billable_hours(data.get('hours')),
                 travel_start_time=_travel_start,
                 travel_end_time=_travel_end,
                 is_manual=True,
+                # 'phone' when the FSA Inspector handset files via the bridge
+                # (it sends source='phone'); the website's Add Inspection form
+                # sends no such flag, so it is 'web' (Ethan, 2026-10-16).
+                source=('phone' if str(data.get('source', '')).strip().lower() == 'phone' else 'web'),
             )
 
             # Generate account code
@@ -3985,8 +4220,6 @@ def api_add_inspection(request):
                 occurrence_kwargs = {
                     'is_occurrence_report': True,
                     'registration_code': data.get('registration_code', ''),
-                    'physical_address': data.get('physical_address', ''),
-                    'telephone': data.get('telephone', ''),
                 }
                 time_of_visit_str = data.get('time_of_visit', '')
                 if time_of_visit_str:
@@ -4012,7 +4245,9 @@ def api_add_inspection(request):
                     is_sample_taken=False,
                     needs_retest='NO',
                     km_traveled=float(data.get('km_traveled', 0) or 0),
-                    hours=float(data.get('hours', 0) or 0),
+                    hours=billable_hours(data.get('hours')),
+                    start_of_inspection=_insp_start,
+                    end_of_inspection=_insp_end,
                     additional_email=data.get('additional_email', ''),
                     comment=data.get('comment', ''),
                     is_manual=True,
@@ -4025,6 +4260,8 @@ def api_add_inspection(request):
                     remote_id=remote_id,
                     inspection_sequence=1,
                     internal_account_code=account_code,
+                    physical_address=data.get('physical_address', ''),
+                    telephone=data.get('telephone', ''),
                     **occurrence_kwargs,
                 )
                 total_created = 1
@@ -4034,6 +4271,10 @@ def api_add_inspection(request):
                     min_rid = _Insp.objects.filter(is_manual=True).aggregate(Min('remote_id'))['remote_id__min']
                     remote_id = -1 if (min_rid is None or min_rid >= 0) else min_rid - 1
 
+                    # Internal sample number: store exactly what the device sent
+                    # (the inspector's real number, written on the bag). Never
+                    # fabricate one on the server — a number that doesn't match
+                    # the bag breaks SANAS traceability.
                     _Insp.objects.create(
                         inspection_group=parent_group,
                         client=client,
@@ -4045,15 +4286,34 @@ def api_add_inspection(request):
                         inspector_name=data.get('inspector_name', 'API User'),
                         inspector_id=manual_inspector_id,
                         town=data.get('town', ''),
+                        # Facility address/phone from the visit, so APS shows
+                        # them on the card (Ethan, 2026-10-08).
+                        physical_address=data.get('physical_address', ''),
+                        telephone=data.get('telephone', ''),
                         is_sample_taken=bool(prod.get('is_sample_taken', False)),
+                        # The verdict the inspector recorded, taken straight
+                        # from the payload. APS used to learn this only from a
+                        # tag in the compliance document's filename, which
+                        # older handset builds do not write - so a pass or
+                        # fail the inspector had actually captured was simply
+                        # dropped, and became unrecoverable once the handset
+                        # purged the visit. None stays None: a product with no
+                        # verdict must not be read as a pass. A later document
+                        # upload can still correct this, never blank it - that
+                        # path only writes on 'compliant'/'non-compliant'
+                        # (Ethan, 2026-11-02).
+                        is_product_compliant=prod.get('is_compliant'),
                         needs_retest=prod.get('needs_retest', 'NO'),
                         fat=bool(prod.get('fat', False)),
                         protein=bool(prod.get('protein', False)),
                         calcium=bool(prod.get('calcium', False)),
                         dna=bool(prod.get('dna', False)),
                         lab=prod.get('lab', ''),
+                        internal_sample_number=prod.get('internal_sample_number', ''),
                         km_traveled=float(data.get('km_traveled', 0) or 0),
-                        hours=float(data.get('hours', 0) or 0),
+                        hours=billable_hours(data.get('hours')),
+                        start_of_inspection=_insp_start,
+                        end_of_inspection=_insp_end,
                         additional_email=data.get('additional_email', ''),
                         comment=data.get('comment', ''),
                         is_manual=True,
@@ -4081,11 +4341,31 @@ def api_add_inspection(request):
                 commodity_counts = Counter(p.get('commodity', '') for p in products_data)
                 commodity_summary = ', '.join([f"{c}: {n}" for c, n in commodity_counts.items()])
 
+        # Which record each product became. The bridge files every document
+        # against its own inspection, so it has to be told the ids: left to
+        # match on commodity and product name, a visit holding two of the
+        # same product files both sheets on the first one, and the office
+        # opens a checklist for the wrong product (Maders Slaghuis, group
+        # 4152, Ethan 2026-10-28). `parent_group` was created by this call,
+        # so these are exactly the inspections it just made, in sent order.
+        created_inspections = [
+            {
+                'sequence': _i.inspection_sequence,
+                'id': _i.id,
+                'commodity': _i.commodity or '',
+                'product_name': _i.product_name or '',
+            }
+            for _i in _Insp.objects
+            .filter(inspection_group=parent_group)
+            .order_by('inspection_sequence', 'id')
+        ]
+
         return _cors(JsonResponse({
             'success': True,
             'message': f"Created {total_created} inspection(s) for {client_name} ({commodity_summary})",
             'group_id': parent_group.id,
             'total_created': total_created,
+            'inspections': created_inspections,
         }))
 
     except Exception as e:
@@ -5804,6 +6084,7 @@ def api_submit_ticket(request):
 #  API: Support Tickets Board
 # ---------------------------------------------------------------------------
 @_csrf_exempt
+@require_capability('manage_support_tickets')
 def api_support_tickets(request):
     import json as _json
     from datetime import date as _date
@@ -5927,6 +6208,7 @@ def api_support_delete_ticket(request, ticket_id):
 
 
 @_csrf_exempt
+@require_capability('manage_support_tickets')
 def api_support_create_ticket(request):
     import json as _json
     from ..models import Ticket
@@ -6404,8 +6686,20 @@ def api_edit_inspection_group(request):
     try:
         data = _json.loads(request.body)
         inspection_id = data.get('inspection_id')
-        if not inspection_id:
-            return _insp_cors(request, JsonResponse({'success': False, 'error': 'inspection_id is required'}))
+        # group_pk addresses a group and nothing else.
+        #
+        # inspection_id is resolved as a product record first and only then as
+        # a group, because that is how the edit page keys it. Group ids and
+        # product ids overlap, so a caller that holds a GROUP id — the
+        # handset bridge does — could correct a different client's group
+        # whenever the numbers collided. The bridge has sent group_pk since
+        # it was written; nothing here read it, so every correction it made
+        # was refused with "inspection_id is required" and an inspection
+        # corrected on the handset never reached the office
+        # (Ethan, 2026-10-08).
+        group_pk = data.get('group_pk')
+        if not inspection_id and not group_pk:
+            return _insp_cors(request, JsonResponse({'success': False, 'error': 'inspection_id or group_pk is required'}))
 
         # Quick update for approved_status only
         approved_only = data.get('approved_status')
@@ -6419,7 +6713,7 @@ def api_edit_inspection_group(request):
                 return _insp_cors(request, JsonResponse(
                     {'success': False, 'error': 'You do not have permission to change approval status.'}, status=403))
             try:
-                group = _Group.objects.get(pk=inspection_id)
+                group = _Group.objects.get(pk=(group_pk or inspection_id))
             except _Group.DoesNotExist:
                 return _insp_cors(request, JsonResponse({'success': False, 'error': 'Group not found'}))
             # Stamp who approved and when — the late-approval tracking needs the
@@ -6440,12 +6734,23 @@ def api_edit_inspection_group(request):
         # product/inspection pk (same as api_get_inspection_group). Group ids and
         # inspection ids overlap numerically, so trying InspectionGroup first
         # silently edited an unrelated client's group whenever the ids collided.
-        try:
-            insp = _Insp.objects.select_related('inspection_group', 'client').get(pk=inspection_id)
-            group = insp.inspection_group
-        except _Insp.DoesNotExist:
-            group = _Group.objects.get(pk=inspection_id)
+        if group_pk:
+            # Unambiguous: the group, never a product that happens to share
+            # the number.
+            try:
+                group = _Group.objects.get(pk=group_pk)
+            except _Group.DoesNotExist:
+                return _insp_cors(request, JsonResponse({'success': False, 'error': 'Group not found'}))
             insp = _Insp.objects.filter(inspection_group=group).select_related('client').first()
+            if insp is None:
+                return _insp_cors(request, JsonResponse({'success': False, 'error': 'Group holds no inspections'}))
+        else:
+            try:
+                insp = _Insp.objects.select_related('inspection_group', 'client').get(pk=inspection_id)
+                group = insp.inspection_group
+            except _Insp.DoesNotExist:
+                group = _Group.objects.get(pk=inspection_id)
+                insp = _Insp.objects.filter(inspection_group=group).select_related('client').first()
 
         # Parse date
         from datetime import datetime as _datetime
@@ -6462,6 +6767,41 @@ def api_edit_inspection_group(request):
         client_name = data.get('client_name', insp.client_name or '').strip()
         town = data.get('town', insp.town or '').strip()
         inspector_name = data.get('inspector_name', insp.inspector_name or '').strip()
+        # Everything the handset files has to be correctable here (Ethan,
+        # 2026-10-20) — the office could change the client and the commodity
+        # but not a word of what the inspector actually wrote. Absent keys
+        # fall back to what is stored, so a caller that sends only some of
+        # them (the bridge does) changes only those.
+        _OPTIONAL_RECORD_FIELDS = (
+            'physical_address', 'telephone', 'registration_code',
+            'time_of_visit', 'occurrence_findings', 'occurrence_description',
+            'occurrence_inspector_name', 'occurrence_manager_name',
+        )
+        record_changes = {
+            key: data[key] for key in _OPTIONAL_RECORD_FIELDS if key in data
+        }
+        # Flags. Sent as real booleans by the edit page; strings tolerated.
+        def _flag(key):
+            if key not in data:
+                return None
+            v = data[key]
+            if isinstance(v, bool):
+                return v
+            return str(v).strip().lower() in ('1', 'true', 'yes', 'y')
+        # The payload names the edit page uses, mapped to the columns. Two
+        # of them differ and setattr would have created a stray attribute
+        # that saved nothing: is_compliant is is_product_compliant, and
+        # direction_raised is is_direction_present_for_this_inspection.
+        _FLAG_FIELDS = {
+            'is_compliant': 'is_product_compliant',
+            'direction_raised': 'is_direction_present_for_this_inspection',
+            'follow_up': 'follow_up',
+            'is_occurrence_report': 'is_occurrence_report',
+        }
+        for _key, _column in _FLAG_FIELDS.items():
+            _val = _flag(_key)
+            if _val is not None:
+                record_changes[_column] = _val
         corporate_group = data.get('corporate_group', '').strip()
         group_type = data.get('group_type', '').strip()
         facility_type = data.get('facility_type', '').strip()
@@ -6470,7 +6810,27 @@ def api_edit_inspection_group(request):
         client_email = data.get('client_email', '').strip()
         comment = data.get('comment', '').strip()
         km_traveled = float(data.get('km_traveled', 0) or 0)
-        hours = float(data.get('hours', 0) or 0)
+        hours = billable_hours(data.get('hours'))
+
+        # Hours and kilometres are what the invoice is worked out from, and
+        # until now nothing checked them: the browser could post anything and
+        # it was stored. A visit was saved at -0.93 hours on 2026-10-12, which
+        # bills as -R502.76, and others carry 100 and 125 hours against a
+        # single kilometre. A negative is never a real measurement, so it is
+        # refused rather than quietly stored or silently clamped -- the person
+        # at the keyboard is the one who knows the right number
+        # (Ethan, 2026-10-12).
+        _negative = []
+        if hours < 0:
+            _negative.append('Hours (%s)' % hours)
+        if km_traveled < 0:
+            _negative.append('KM Traveled (%s)' % km_traveled)
+        if _negative:
+            return _insp_cors(request, JsonResponse({
+                'success': False,
+                'error': 'Cannot be negative: %s. Enter a positive number.'
+                         % ', '.join(_negative),
+            }))
         travel_start_time = data.get('travel_start_time', '') or ''
         travel_end_time = data.get('travel_end_time', '') or ''
         products_data = data.get('products', [])
@@ -6576,6 +6936,18 @@ def api_edit_inspection_group(request):
             else:
                 related_inspections = [insp]
 
+            # The per-record particulars and the occurrence report's own
+            # words. They belong to every record under the group — the
+            # handset writes the same values to each — so they are set the
+            # same way here (Ethan, 2026-10-20).
+            if record_changes:
+                for _rel in related_inspections:
+                    for _field, _value in record_changes.items():
+                        setattr(_rel, _field, _value)
+                    _rel.inspector_name = inspector_name or _rel.inspector_name
+                    _rel.save(update_fields=list(record_changes) +
+                              ['inspector_name', 'updated_at'])
+
             if products_data:
                 # Group products_data by commodity
                 products_by_commodity = defaultdict(list)
@@ -6601,6 +6973,7 @@ def api_edit_inspection_group(request):
                             rel.product_name = prod.get('product_name', '')
                             rel.product_class = prod.get('product_class', '')
                             rel.lab = prod.get('lab', '')
+                            rel.internal_sample_number = prod.get('internal_sample_number', '')
                             rel.is_sample_taken = prod.get('is_sample_taken', False)
                             rel.fat = prod.get('fat', False)
                             rel.protein = prod.get('protein', False)
@@ -7160,3 +7533,24 @@ def api_send_occurrence_email(request):
         import traceback
         traceback.print_exc()
         return JsonResponse({'success': False, 'error': str(e)}, status=500)
+
+
+@_csrf_exempt
+def api_update_group_approved(request):
+    """API form of update_group_approved for the FSA Inspector bridge: an
+    inspector's approval given on the handset. The plain route sits behind
+    the web front end, which the bridge cannot reach; this one is under
+    /api/, where the login middleware guarantees a signed-in session
+    (Ethan, 2026-10-04)."""
+    def _cors(response):
+        response['Access-Control-Allow-Origin'] = _get_cors_origin(request)
+        response['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response['Access-Control-Allow-Headers'] = 'Content-Type, X-CSRFToken'
+        return response
+    if request.method == 'OPTIONS':
+        return _cors(JsonResponse({'ok': True}))
+    if request.method != 'POST':
+        return _cors(JsonResponse(
+            {'success': False, 'error': 'Method not allowed'}, status=405))
+    from .core_views import update_group_approved as _core_update
+    return _cors(_core_update(request))

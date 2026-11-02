@@ -95,7 +95,7 @@ export default function MultiSelectDropdown({
           gap: 6,
         }}
       >
-        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+        <span title={buttonLabel} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {buttonLabel}
         </span>
         <i
@@ -179,6 +179,7 @@ export default function MultiSelectDropdown({
               filteredOptions.map((opt) => (
                 <label
                   key={opt}
+                  title={labelOf(opt)}
                   style={{
                     display: "flex",
                     alignItems: "center",
@@ -198,7 +199,7 @@ export default function MultiSelectDropdown({
                     onChange={() => toggle(opt)}
                     style={{ accentColor: "#007890", flexShrink: 0 }}
                   />
-                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{labelOf(opt)}</span>
+                  <span title={labelOf(opt)} style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{labelOf(opt)}</span>
                 </label>
               ))
             )}

@@ -62,7 +62,7 @@ CAPABILITIES = {
     # Field inspectors record and correct their own inspection data
     # (km traveled, hours, travel times, comments) via the edit/save flow.
     'edit_inspections':        _OFFICE | {INSPECTOR_MANAGER, INSPECTOR},
-    'manage_support_tickets':  _OFFICE,
+    'manage_support_tickets':  frozenset({SUPER_ADMIN}),  # super_admin only (Ethan, 2026-10-13)
 
     # Documents & lab
     'delete_documents':        _FINANCE | {LAB_TECHNICIAN},   # everyone except field inspectors

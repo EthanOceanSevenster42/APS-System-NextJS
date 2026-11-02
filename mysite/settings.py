@@ -28,7 +28,7 @@ SECRET_KEY = env('SECRET_KEY', default='django-insecure-@=2jh*jwvj#7=oh+4+ae2)y9
 WEEKLY_INTERNAL_KEY = env('WEEKLY_INTERNAL_KEY', default='aps-weekly-internal-2026')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = env.bool('DEBUG', default=True)  # Set to True for demo
+DEBUG = env.bool('DEBUG', default=False)  # Safe default; prod .env may override
 
 LOGIN_REDIRECT_URL = 'home'
 LOGIN_URL = 'login'
@@ -150,7 +150,14 @@ CACHES = {
     'default': {
         'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
         'LOCATION': 'unique-snowflake',
-    }
+    },
+    # Shared across gunicorn workers (LocMemCache is per-process) and durable,
+    # so the login brute-force throttle in api_login actually counts. Table
+    # created with: manage.py createcachetable (name below).
+    'throttle': {
+        'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
+        'LOCATION': 'throttle_cache',
+    },
 }
 
 # Server settings to handle large responses

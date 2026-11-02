@@ -28,6 +28,7 @@ interface Product {
   is_product_compliant: boolean;
   is_sample_taken: boolean;
   needs_retest: string;
+  internal_sample_number?: string;
   coa_uploaded: boolean;
   compliance_uploaded: boolean;
   composition_uploaded: boolean;
@@ -53,6 +54,7 @@ function normalizeProduct(p: Partial<Product> & { id: number }): Product {
     is_product_compliant: p.is_product_compliant ?? true,
     is_sample_taken: p.is_sample_taken ?? false,
     needs_retest: p.needs_retest || '',
+    internal_sample_number: p.internal_sample_number || '',
     coa_uploaded: p.coa_uploaded ?? false,
     compliance_uploaded: p.compliance_uploaded ?? false,
     composition_uploaded: p.composition_uploaded ?? false,
@@ -88,6 +90,8 @@ interface Inspection {
   has_invoice?: boolean;
   has_lab?: boolean;
   has_compliance?: boolean;
+  has_rejection?: boolean;
+  has_seizure?: boolean;
   is_occurrence_report?: boolean;
   inspection_compliance_status?: string;
   email?: string;
@@ -110,6 +114,7 @@ interface Inspection {
   approval_lag_days?: number | null;
   late_approval?: boolean;
   products?: Product[];
+  source?: string;  // 'phone' (FSA Inspector handset) or 'web' (added in APS)
 }
 
 /* Where an inspection sits in the back-office process, from the fields the
@@ -253,7 +258,109 @@ const LAB_NAME_TO_CODE: Record<string, string> = {
   "SANBI": "lab_d",
   "SMT": "lab_e",
   "ARC": "lab_f",
+  "Food Consulting Services (FCS)": "lab_g",
+  "AssureCloud/NOSA": "lab_h",
 };
+
+/** Single-choice dropdown styled to match IrMultiSelect's trigger and panel.
+ *  The native <select> opened full-width in the browser's own styling,
+ *  which looked nothing like the filters beside it. */
+function IrSortSelect({ value, options, onChange }: {
+  value: string;
+  options: { value: string; label: string }[];
+  onChange: (v: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const [pos, setPos] = useState<{ top: number; left: number; width: number }>(
+    { top: 0, left: 0, width: 0 });
+
+  useEffect(() => {
+    const h = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", h);
+    return () => document.removeEventListener("mousedown", h);
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = () => setOpen(false);
+    window.addEventListener("scroll", close, true);
+    window.addEventListener("resize", close);
+    return () => {
+      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("resize", close);
+    };
+  }, [open]);
+
+  const current = options.find(o => o.value === value);
+
+  const toggle = () => {
+    if (!open && btnRef.current) {
+      const r = btnRef.current.getBoundingClientRect();
+      setPos({ top: r.bottom + 4, left: r.left, width: r.width });
+    }
+    setOpen(o => !o);
+  };
+
+  return (
+    <div ref={ref} style={{ position: "relative" }}>
+      <button ref={btnRef} type="button" onClick={toggle}
+        style={{
+          width: "100%", display: "flex", alignItems: "center",
+          justifyContent: "space-between", gap: 8,
+          padding: "6px 10px", fontSize: "0.8rem",
+          border: "1px solid #e5e7eb", borderRadius: 6,
+          background: open ? "#f9fafb" : "white",
+          color: "#1f2937", cursor: "pointer", textAlign: "left",
+        }}>
+        <span style={{ overflow: "hidden", textOverflow: "ellipsis",
+                       whiteSpace: "nowrap" }}>
+          {current ? current.label : "Select..."}
+        </span>
+        <i className={`fas fa-chevron-${open ? "up" : "down"}`}
+           style={{ fontSize: 10, flexShrink: 0, color: "#9ca3af" }} />
+      </button>
+      {open && (
+        <div style={{
+          position: "fixed", top: pos.top, left: pos.left, width: pos.width,
+          background: "white", border: "1px solid #e5e7eb", borderRadius: 6,
+          boxShadow: "0 4px 12px rgba(0,0,0,0.1)", zIndex: 2000,
+          overflow: "hidden",
+        }}>
+          {options.map(o => {
+            const on = o.value === value;
+            return (
+              <div key={o.value}
+                onClick={() => { onChange(o.value); setOpen(false); }}
+                style={{
+                  padding: "6px 10px", fontSize: "0.8rem", cursor: "pointer",
+                  display: "flex", alignItems: "center", gap: 8,
+                  background: on ? "#e0f2fe" : "white",
+                  color: on ? "#075985" : "#1f2937",
+                  fontWeight: on ? 600 : 400,
+                }}
+                onMouseEnter={e => {
+                  if (!on) (e.currentTarget as HTMLDivElement).style.background = "#f9fafb";
+                }}
+                onMouseLeave={e => {
+                  if (!on) (e.currentTarget as HTMLDivElement).style.background = "white";
+                }}>
+                <i className="fas fa-check"
+                   style={{ fontSize: 10, width: 12, flexShrink: 0,
+                            color: on ? "#007890" : "transparent" }} />
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis",
+                               whiteSpace: "nowrap" }}>{o.label}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function IrMultiSelect({ label, options, selected, onChange, searchable, optionLabels }: { label: string; options: string[]; selected: string[]; onChange: (v: string[]) => void; searchable?: boolean; optionLabels?: Record<string, string> }) {
   return (
@@ -339,6 +446,11 @@ export default function InspectionsPage() {
   const [inspections, setInspections] = useState<Inspection[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [confirmBox, setConfirmBox] = useState<{ message: string; resolve: (v: boolean) => void } | null>(null);
+  const askConfirm = useCallback(
+    (message: string) => new Promise<boolean>(resolve => setConfirmBox({ message, resolve })),
+    []
+  );
   const [clientSearch, setClientSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [dateFrom, setDateFrom] = useState("");
@@ -373,6 +485,7 @@ export default function InspectionsPage() {
   const [otherFileFilter, setOtherFileFilter] = useState<string[]>([]);
   const [emailFilter, setEmailFilter] = useState("");
   const [occurrenceFilter, setOccurrenceFilter] = useState<string[]>([]);
+  const [sourceFilter, setSourceFilter] = useState<string[]>([]);
   const [sampledFilter, setSampledFilter] = useState<string[]>([]);
   const [commodityFilter, setCommodityFilter] = useState<string[]>([]);
   const [lateCaptureFilter, setLateCaptureFilter] = useState<string[]>([]);
@@ -396,6 +509,7 @@ export default function InspectionsPage() {
     corporateGroup: [] as string[],
     groupType: [] as string[],
     occurrence: [] as string[],
+    source: [] as string[],
     sampled: [] as string[],
     commodity: [] as string[],
     sentStatus: [] as string[],
@@ -738,7 +852,7 @@ export default function InspectionsPage() {
 
   const fetchInspections = useCallback((duplicates?: boolean, from?: string, to?: string, page?: number, search?: string, filters?: {
     inspector?: string[]; corporateGroup?: string[];
-    groupType?: string[]; occurrence?: string[]; sampled?: string[]; commodity?: string[]; sentStatus?: string[];
+    groupType?: string[]; occurrence?: string[]; source?: string[]; sampled?: string[]; commodity?: string[]; sentStatus?: string[];
     compliance?: string[]; approved?: string[]; email?: string;
     rfi?: string[]; invoice?: string[]; coaFile?: string[]; complianceFile?: string[]; otherFile?: string[];
     retest?: string[]; coaStatus?: string[]; lab?: string[]; testType?: string[]; lateCapture?: string[];
@@ -757,6 +871,7 @@ export default function InspectionsPage() {
       if (filters.corporateGroup?.length) filters.corporateGroup.forEach(v => p.append("corporate_group", v));
       if (filters.groupType?.length) filters.groupType.forEach(v => p.append("group_type", v));
       if (filters.occurrence?.length) filters.occurrence.forEach(v => p.append("occurrence", v));
+      if (filters.source?.length) filters.source.forEach(v => p.append("source", v));
       if (filters.sampled?.length) filters.sampled.forEach(v => p.append("sampled", v));
       if (filters.commodity?.length) filters.commodity.forEach(v => p.append("commodity", v));
       if (filters.sentStatus?.length) filters.sentStatus.forEach(v => p.append("sent_status", v));
@@ -1293,6 +1408,8 @@ export default function InspectionsPage() {
                     has_lab: s.has_lab || (f.coa && f.coa.length > 0) || (f.lab && f.lab.length > 0),
                     has_compliance: s.has_compliance || (f.compliance && f.compliance.length > 0) || (f.composition && f.composition.length > 0),
                     has_lab_form: s.has_lab_form || (f.lab_form && f.lab_form.length > 0),
+                    has_rejection: s.has_rejection || (f.rejection && f.rejection.length > 0),
+                    has_seizure: s.has_seizure || (f.seizure && f.seizure.length > 0),
                     products: s.products?.map(p => {
                       const hasLabFiles = (f.coa && f.coa.length > 0) || (f.lab && f.lab.length > 0);
                       return {
@@ -1464,7 +1581,12 @@ export default function InspectionsPage() {
             <div style={{ fontSize: 11, color: "#374151", fontWeight: 500 }}>
               {truncate(s.client_name || "", 22)}
             </div>
-            {s.town && (
+            {/* The town, unless it is just the physical address repeated:
+                the handset captures one address line and it is written to
+                both fields, so the card would show it twice. */}
+            {s.town
+              && s.town.trim().replace(/\s+/g, " ").toLowerCase()
+                 !== (s.physical_address || "").trim().replace(/\s+/g, " ").toLowerCase() && (
               <div style={{ fontSize: 8, color: "#6b7280", margin: "2px 0" }}>
                 <i className="fas fa-map-marker-alt" style={{ width: 10, color: "#007890" }} />
                 <span style={{ fontWeight: 500 }}>{s.town}</span>
@@ -1491,6 +1613,18 @@ export default function InspectionsPage() {
               <div style={{ fontSize: 8, color: "#6b7280", marginBottom: 2 }} title="Internal account code">
                 <i className="fas fa-id-badge" style={{ width: 10, color: "#007890" }} />
                 <span style={{ fontWeight: 600 }}>Account: {s.internal_account_code}</span>
+              </div>
+            )}
+            {!isOccurrence && s.physical_address && (
+              <div style={{ fontSize: 8, color: "#6b7280", marginBottom: 2 }} title="Physical address">
+                <i className="fas fa-map-marker-alt" style={{ width: 10, color: "#007890" }} />
+                <span>{truncate(s.physical_address, 34)}</span>
+              </div>
+            )}
+            {!isOccurrence && s.telephone && (
+              <div style={{ fontSize: 8, color: "#6b7280", marginBottom: 2 }} title="Telephone">
+                <i className="fas fa-phone" style={{ width: 10, color: "#007890" }} />
+                <span>{s.telephone}</span>
               </div>
             )}
 
@@ -1679,6 +1813,11 @@ export default function InspectionsPage() {
                           Class: <span style={{ fontWeight: 600, color: "#374151" }}>{product.product_class || "N/A"}</span>
                         </div>
                       )}
+                      {product.internal_sample_number ? (
+                        <div style={{ fontSize: 9, color: "#6b7280", marginBottom: 4, wordBreak: "break-word" }}>
+                          Sample No: <span style={{ fontWeight: 700, color: "#0f766e" }}>{product.internal_sample_number}</span>
+                        </div>
+                      ) : null}
                       <div style={{ display: "flex", flexDirection: "column", gap: 2, alignItems: "flex-start" }}>
                         {sampleBadge && (
                           <span style={{ fontSize: 7, padding: "2px 4px", background: sampleBadge.bg, color: "white", borderRadius: 2 }}>
@@ -1883,6 +2022,22 @@ export default function InspectionsPage() {
 
   return (
     <>
+      {confirmBox && (
+        <div onClick={() => { confirmBox.resolve(false); setConfirmBox(null); }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.45)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 10000 }}>
+          <div onClick={e => e.stopPropagation()}
+            style={{ background: "#fff", borderRadius: 12, padding: 24, width: "min(440px, 92vw)", boxShadow: "0 20px 50px rgba(0,0,0,0.25)" }}>
+            <h3 style={{ margin: "0 0 10px", fontSize: 18, fontWeight: 700, color: "#054B70" }}>Please confirm</h3>
+            <p style={{ margin: "0 0 20px", whiteSpace: "pre-line", color: "#334155", lineHeight: 1.45 }}>{confirmBox.message}</p>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+              <button onClick={() => { confirmBox.resolve(false); setConfirmBox(null); }}
+                style={{ padding: "9px 16px", borderRadius: 8, border: "1px solid #cbd5e1", background: "#fff", color: "#334155", fontWeight: 600, cursor: "pointer" }}>Cancel</button>
+              <button onClick={() => { confirmBox.resolve(true); setConfirmBox(null); }}
+                style={{ padding: "9px 16px", borderRadius: 8, border: "none", background: "#ef4444", color: "#fff", fontWeight: 600, cursor: "pointer" }}>Delete</button>
+            </div>
+          </div>
+        </div>
+      )}
       <style>{`
         @keyframes spin { to { transform: rotate(360deg) } }
         .ir-mobile-cards { display: none; }
@@ -2283,15 +2438,15 @@ export default function InspectionsPage() {
                 <div style={{ display: "flex", gap: 12, alignItems: "flex-end", flexWrap: "wrap", marginBottom: 14 }}>
                   <div className="ir-filter-field" style={{ minWidth: 220 }}>
                     <label className="ir-form-label">Sort By</label>
-                    <select value={sortBy}
-                      onChange={e => { const v = e.target.value; setSortBy(v); const af = { ...appliedFilters, sort: v }; setAppliedFilters(af); setCurrentPage(1); fetchInspections(showDuplicates, dateFrom, dateTo, 1, debouncedSearch, af); }}
-                      style={{ width: "100%", padding: "6px 10px", fontSize: "0.8rem", border: "1px solid #e5e7eb", borderRadius: 6, background: "white", color: "#1f2937", cursor: "pointer" }}>
-                      <option value="date_desc">Inspection date — newest</option>
-                      <option value="date_asc">Inspection date — oldest</option>
-                      <option value="late_desc">Most days late</option>
-                      <option value="late_asc">Least days late</option>
-                      <option value="captured_desc">Recently captured</option>
-                    </select>
+                    <IrSortSelect value={sortBy}
+                      options={[
+                        { value: "date_desc", label: "Inspection date \u2014 newest" },
+                        { value: "date_asc", label: "Inspection date \u2014 oldest" },
+                        { value: "late_desc", label: "Most days late" },
+                        { value: "late_asc", label: "Least days late" },
+                        { value: "captured_desc", label: "Recently captured" },
+                      ]}
+                      onChange={v => { setSortBy(v); const af = { ...appliedFilters, sort: v }; setAppliedFilters(af); setCurrentPage(1); fetchInspections(showDuplicates, dateFrom, dateTo, 1, debouncedSearch, af); }} />
                   </div>
                   <button type="button" onClick={() => setShowMoreFilters(v => !v)}
                     title={showMoreFilters ? "Hide the extra filters" : "Show all the extra filters"}
@@ -2299,7 +2454,7 @@ export default function InspectionsPage() {
                     <i className="fas fa-sliders-h" />
                     {showMoreFilters ? "Fewer filters" : "More filters"}
                     <i className={`fas fa-chevron-${showMoreFilters ? "up" : "down"}`} style={{ fontSize: 10 }} />
-                    {(() => { const c = [inspectorFilter, corpGroupFilter, groupTypeFilter, occurrenceFilter, sampledFilter, commodityFilter, sentStatusFilter, lateCaptureFilter, lateApprovalFilter, complianceFilter, approvedFilter, rfiFilter, invoiceFilter, coaFileFilter, complianceFileFilter, otherFileFilter, labFilter, testTypeFilter, retestFilter].filter(a => a && a.length > 0).length; return c > 0 ? <span style={{ background: "#007890", color: "white", borderRadius: 999, padding: "1px 8px", fontSize: 11, fontWeight: 700 }}>{c}</span> : null; })()}
+                    {(() => { const c = [inspectorFilter, corpGroupFilter, groupTypeFilter, occurrenceFilter, sourceFilter, sampledFilter, commodityFilter, sentStatusFilter, lateCaptureFilter, lateApprovalFilter, complianceFilter, approvedFilter, rfiFilter, invoiceFilter, coaFileFilter, complianceFileFilter, otherFileFilter, labFilter, testTypeFilter, retestFilter].filter(a => a && a.length > 0).length; return c > 0 ? <span style={{ background: "#007890", color: "white", borderRadius: 999, padding: "1px 8px", fontSize: 11, fontWeight: 700 }}>{c}</span> : null; })()}
                   </button>
                 </div>
 
@@ -2310,6 +2465,7 @@ export default function InspectionsPage() {
                   <IrMultiSelect label="Business" options={corpGroupOptions} selected={corpGroupFilter} onChange={setCorpGroupFilter} searchable />
                   <IrMultiSelect label="Store Type" options={groupTypeOptions} selected={groupTypeFilter} onChange={setGroupTypeFilter} searchable />
                   <IrMultiSelect label="Occurrence" options={["OCCURRENCE", "INSPECTION"]} selected={occurrenceFilter} onChange={setOccurrenceFilter} />
+                  <IrMultiSelect label="Captured on" options={["PHONE", "WEB"]} optionLabels={{ PHONE: "Phone (handset)", WEB: "Web (added in APS)" }} selected={sourceFilter} onChange={setSourceFilter} />
                   <IrMultiSelect label="Sampled" options={["SAMPLED", "NOT_SAMPLED"]} selected={sampledFilter} onChange={setSampledFilter} />
                   <IrMultiSelect label="Commodity" options={["POULTRY", "EGGS", "PMP", "RAW"]} selected={commodityFilter} onChange={setCommodityFilter} />
                   <IrMultiSelect label="Sent Status" options={["SENT", "NOT_SENT"]} selected={sentStatusFilter} onChange={setSentStatusFilter} />
@@ -2324,7 +2480,7 @@ export default function InspectionsPage() {
                   <IrMultiSelect label="Has Other" options={["HAS_OTHER", "NO_OTHER"]} selected={otherFileFilter} onChange={setOtherFileFilter} />
                   {roleLoaded && (isLabTech || role === "super_admin" || role === "developer") && (
                     <>
-                      <IrMultiSelect label="Lab" options={["Food Safety Laboratory", "Merieux NutriSciences", "AGRI Food Laboratory (SGS)", "SANBI", "SMT", "ARC"]} selected={labFilter} onChange={setLabFilter} />
+                      <IrMultiSelect label="Lab" options={Object.keys(LAB_NAME_TO_CODE)} selected={labFilter} onChange={setLabFilter} />
                       <IrMultiSelect label="Test Type" options={["DNA", "FAT", "PROTEIN", "CALCIUM"]} selected={testTypeFilter} onChange={setTestTypeFilter} />
                       <IrMultiSelect label="Needs Retest" options={["NEEDS_RETEST", "NO_RETEST"]} selected={retestFilter} onChange={setRetestFilter} />
                     </>
@@ -2336,8 +2492,8 @@ export default function InspectionsPage() {
                 <div className="ir-filter-actions">
                   <button type="button" className="ir-btn ir-btn-secondary" style={{ padding: "8px 16px", fontSize: 14 }}
                     onClick={() => {
-                      setClientSearch(""); setDateFrom(""); setDateTo(""); setInspectorFilter([]); setCorpGroupFilter([]); setGroupTypeFilter([]); setSentStatusFilter([]); setComplianceFilter([]); setApprovedFilter([]); setFileStatusFilter([]); setRfiFilter([]); setInvoiceFilter([]); setCoaFileFilter([]); setComplianceFileFilter([]); setOtherFileFilter([]); setEmailFilter(""); setRetestFilter([]); setCoaStatusFilter([]); setLabFilter([]); setTestTypeFilter([]); setOccurrenceFilter([]); setSampledFilter([]); setCommodityFilter([]); setLateCaptureFilter([]); setLateApprovalFilter([]); setSortBy("date_desc");
-                      setAppliedFilters({ inspector: [], corporateGroup: [], groupType: [], occurrence: [], sampled: [], commodity: [], sentStatus: [], compliance: [], approved: [], fileStatus: [], rfi: [], invoice: [], coaFile: [], complianceFile: [], otherFile: [], email: "", retest: [], coaStatus: [], lab: [], testType: [], lateCapture: [], lateApproval: [], sort: "date_desc" });
+                      setClientSearch(""); setDateFrom(""); setDateTo(""); setInspectorFilter([]); setCorpGroupFilter([]); setGroupTypeFilter([]); setSentStatusFilter([]); setComplianceFilter([]); setApprovedFilter([]); setFileStatusFilter([]); setRfiFilter([]); setInvoiceFilter([]); setCoaFileFilter([]); setComplianceFileFilter([]); setOtherFileFilter([]); setEmailFilter(""); setRetestFilter([]); setCoaStatusFilter([]); setLabFilter([]); setTestTypeFilter([]); setOccurrenceFilter([]); setSourceFilter([]); setSampledFilter([]); setCommodityFilter([]); setLateCaptureFilter([]); setLateApprovalFilter([]); setSortBy("date_desc");
+                      setAppliedFilters({ inspector: [], corporateGroup: [], groupType: [], occurrence: [], source: [], sampled: [], commodity: [], sentStatus: [], compliance: [], approved: [], fileStatus: [], rfi: [], invoice: [], coaFile: [], complianceFile: [], otherFile: [], email: "", retest: [], coaStatus: [], lab: [], testType: [], lateCapture: [], lateApproval: [], sort: "date_desc" });
                       setCurrentPage(1);
                       fetchInspections(showDuplicates, "", "", 1, "");
                     }}>
@@ -2347,7 +2503,7 @@ export default function InspectionsPage() {
                     onClick={() => {
                       const af = {
                         inspector: inspectorFilter, corporateGroup: corpGroupFilter,
-                        groupType: groupTypeFilter, occurrence: occurrenceFilter, sampled: sampledFilter,
+                        groupType: groupTypeFilter, occurrence: occurrenceFilter, source: sourceFilter, sampled: sampledFilter,
                         commodity: commodityFilter,
                         sentStatus: sentStatusFilter, compliance: complianceFilter, approved: approvedFilter,
                         fileStatus: fileStatusFilter, rfi: rfiFilter, invoice: invoiceFilter,
@@ -2543,6 +2699,8 @@ export default function InspectionsPage() {
                         <span className={`ir-badge ${s.has_invoice ? "ir-badge-green" : "ir-badge-red"}`}>Inv: {s.has_invoice ? "Yes" : "No"}</span>
                         <span className={`ir-badge ${s.has_lab ? "ir-badge-green" : "ir-badge-red"}`}>COA: {s.has_lab ? "Yes" : "No"}</span>
                         <span className={`ir-badge ${s.has_compliance ? "ir-badge-green" : "ir-badge-red"}`}>Comp: {s.has_compliance ? "Yes" : "No"}</span>
+                        {s.has_rejection && <span className="ir-badge ir-badge-green">Rej: Yes</span>}
+                        {s.has_seizure && <span className="ir-badge ir-badge-green">Sei: Yes</span>}
                       </div>
                       {s.email && <div style={{ fontSize: 11, color: "#3b82f6", wordBreak: "break-all" }}>{s.email}</div>}
                       {/* Action Buttons */}
@@ -2565,7 +2723,7 @@ export default function InspectionsPage() {
                           <button style={{ flex: 1, padding: "8px", background: "#ef4444", color: "white", border: "none", borderRadius: 6, fontSize: 12, fontWeight: 500, cursor: "pointer" }}
                             onClick={async e => {
                               e.stopPropagation();
-                              if (!confirm(`Delete inspection for "${s.client_name}" on ${s.date_of_inspection ? new Date(s.date_of_inspection).toLocaleDateString("en-GB") : "unknown date"}?\n\nThis cannot be undone.`)) return;
+                              if (!(await askConfirm(`Delete inspection for "${s.client_name}" on ${s.date_of_inspection ? new Date(s.date_of_inspection).toLocaleDateString("en-GB") : "unknown date"}?\n\nThis cannot be undone.`))) return;
                               try {
                                 const res = await fetch("/api/delete-inspection-group/", {
                                   method: "POST",
@@ -2641,6 +2799,17 @@ export default function InspectionsPage() {
                                   {showDuplicates && <span style={{ background: "#fef3c7", color: "#92400e", fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 99, marginLeft: 6, verticalAlign: "middle", display: "inline-block" }}>DUPLICATE</span>}
                                 </div>
                                 {s.inspector_name && <div style={{ fontSize: "0.65rem", color: "#6b7280", marginTop: 4 }}>{s.inspector_name}</div>}
+                                {s.source && (
+                                  <div style={{ marginTop: 4 }}>
+                                    <span
+                                      title={s.source === "phone" ? "Captured on the FSA Inspector handset (phone)" : "Added on the APS website"}
+                                      style={{ display: "inline-block", fontSize: 9, fontWeight: 700, padding: "1px 6px", borderRadius: 99,
+                                        background: s.source === "phone" ? "#e0f2fe" : "#f3f4f6",
+                                        color: s.source === "phone" ? "#075985" : "#374151" }}>
+                                      {s.source === "phone" ? "Phone" : "Web"}
+                                    </span>
+                                  </div>
+                                )}
                                 {(() => {
                                   const comms = groupCommodities(s);
                                   if (comms.length === 0) return null;
@@ -2698,6 +2867,12 @@ export default function InspectionsPage() {
                                       <i className={`fas fa-${s.has_compliance ? "check" : "times"}`} style={{ fontSize: 8 }} /> CMP
                                     </span>
                                   )}
+                                  <span className={`ir-badge ${s.has_rejection ? "ir-badge-green" : "ir-badge-grey"}`} title={s.has_rejection ? "Rejection served" : "No rejection"}>
+                                    <i className={`fas fa-${s.has_rejection ? "check" : "minus"}`} style={{ fontSize: 8 }} /> REJ
+                                  </span>
+                                  <span className={`ir-badge ${s.has_seizure ? "ir-badge-green" : "ir-badge-grey"}`} title={s.has_seizure ? "Seizure served" : "No seizure"}>
+                                    <i className={`fas fa-${s.has_seizure ? "check" : "minus"}`} style={{ fontSize: 8 }} /> SEI
+                                  </span>
                                 </div>
                             </td>
                             <td style={{ fontSize: "0.65rem", whiteSpace: "nowrap" }}>
@@ -2791,17 +2966,33 @@ export default function InspectionsPage() {
                                     e.stopPropagation();
                                     if (!s.sent_date) {
                                       handleSendDocuments(s);
-                                    } else {
-                                      alert("Documents already sent.");
+                                      return;
+                                    }
+                                    // Already sent once. Sending again is a
+                                    // deliberate act -- usually a bounced
+                                    // address that has since been corrected --
+                                    // so it is confirmed, and the address is
+                                    // named so the sender can see the
+                                    // correction took.
+                                    const to = (s.email || "").trim();
+                                    const when = new Date(s.sent_date).toLocaleString("en-GB");
+                                    if (window.confirm(
+                                      `Already sent by ${s.sent_by_name || "Unknown"} on ${when}.
+
+` +
+                                      `Send again to:
+${to || "(no address on this inspection)"}`
+                                    )) {
+                                      handleSendDocuments(s);
                                     }
                                   }}
                                   disabled={sendingId === s.id}
-                                  title={s.sent_date ? `Documents sent by ${s.sent_by_name || "Unknown"} at ${new Date(s.sent_date).toLocaleString("en-GB")}` : "Send documents to client"}
+                                  title={s.sent_date ? `Sent by ${s.sent_by_name || "Unknown"} at ${new Date(s.sent_date).toLocaleString("en-GB")} — click to send again` : "Send documents to client"}
                                   style={{
                                     padding: "3px 8px",
                                     border: "none",
                                     borderRadius: 4,
-                                    cursor: s.sent_date ? "default" : sendingId === s.id ? "wait" : "pointer",
+                                    cursor: sendingId === s.id ? "wait" : "pointer",
                                     fontSize: 11,
                                     fontWeight: 600,
                                     whiteSpace: "nowrap",
@@ -2833,7 +3024,7 @@ export default function InspectionsPage() {
                                       title="Delete"
                                       onClick={async e => {
                                         e.stopPropagation();
-                                        if (!confirm(`Delete inspection for "${s.client_name}" on ${s.date_of_inspection ? new Date(s.date_of_inspection).toLocaleDateString("en-GB") : "unknown date"}?\n\nThis cannot be undone.`)) return;
+                                        if (!(await askConfirm(`Delete inspection for "${s.client_name}" on ${s.date_of_inspection ? new Date(s.date_of_inspection).toLocaleDateString("en-GB") : "unknown date"}?\n\nThis cannot be undone.`))) return;
                                         try {
                                           console.log(`[Delete] Deleting group_id=${s.group_id}, client=${s.client_name}, id=${s.id}`);
                                           const res = await fetch("/api/delete-inspection-group/", {
@@ -2993,6 +3184,8 @@ export default function InspectionsPage() {
                   { key: "compliance", label: "Compliance", color: "#22c55e", icon: "fa-check-double" },
                   { key: "occurrence", label: "Occurrence", color: "#ef4444", icon: "fa-exclamation-triangle" },
                   { key: "composition", label: "Composition", color: "#ec4899", icon: "fa-vial" },
+                  { key: "rejection", label: "Rejection", color: "#dc2626", icon: "fa-ban" },
+                  { key: "seizure", label: "Seizure", color: "#b91c1c", icon: "fa-box-archive" },
                   { key: "other", label: "Other", color: "#6b7280", icon: "fa-paperclip" },
                 ];
                 const totalFiles = Object.values(filesModal.files).reduce((sum, arr) => sum + (arr?.length || 0), 0);
@@ -3061,7 +3254,7 @@ export default function InspectionsPage() {
                                   {!isInspector && (
                                     <button
                                       onClick={async () => {
-                                        if (!confirm(`Delete "${f.name}"?`)) return;
+                                        if (!(await askConfirm(`Delete "${f.name}"?`))) return;
                                         const res = await fetch("/api/delete-file", {
                                           method: "POST",
                                           headers: { "Content-Type": "application/json" },
@@ -3250,7 +3443,7 @@ export default function InspectionsPage() {
                                         <i className="fas fa-eye" style={{ fontSize: 9 }} />View
                                       </a>
                                       <button onClick={async () => {
-                                        if (!confirm(`Delete ${inv.corporate_group} - ${monthLabel} invoice?`)) return;
+                                        if (!(await askConfirm(`Delete ${inv.corporate_group} - ${monthLabel} invoice?`))) return;
                                         await fetch("/api/corporate-invoice-file", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ corporate_group: inv.corporate_group_raw, month: inv.month }) });
                                         fetchAllCorpInvoices();
                                       }}

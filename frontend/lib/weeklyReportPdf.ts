@@ -69,7 +69,8 @@ export interface KpiCommodityRow {
 }
 export interface FinanceStage {
   avg: number | null; median: number | null; count: number;
-  prev_avg: number | null; prev_count: number; target: number | null; label: string;
+  prev_avg: number | null; prev_median: number | null;
+  prev_count: number; target: number | null; label: string;
 }
 export interface FinanceEfficiency {
   timeliness: { approval: FinanceStage; send_docs: FinanceStage; invoice: FinanceStage; sample_to_coa: FinanceStage };
@@ -82,6 +83,7 @@ export interface FinanceEfficiency {
 export interface TravelRow {
   inspector_name: string; km: number; hours: number; inspections: number;
   avg_km_per_inspection: number; new_facilities: number; rank: number;
+  facilities?: number; km_per_facility?: number;
 }
 export interface InspectionDetailRow {
   date: string | null; client: string; commodity: string;
@@ -93,6 +95,18 @@ export interface InspectorDetail {
   daily: { date: string; count: number }[];
   inspections: InspectionDetailRow[];
 }
+export interface WeeklyFinancials {
+  rows: { inspector_name: string; inspections: number; hours: number;
+          revenue: number; cost: number; profit: number }[];
+  week_start: string; week_end: string; label: string;
+  total_revenue: number; total_cost: number; total_profit: number;
+}
+
+export interface LabResultCount {
+  needed: number; back: number;
+  taken?: number; not_due_yet?: number; allowed_days?: number;
+}
+
 export interface ReportResponse {
   success: boolean;
   inspector_detail?: InspectorDetail | null;
@@ -103,6 +117,8 @@ export interface ReportResponse {
     samples: number; occurrences: number; approved: number; pending: number;
     overall_compliance: number | null; prev_overall_compliance: number | null;
     total_km: number; total_hours: number;
+  total_facilities?: number; avg_km_per_facility?: number;
+  avg_hours_per_facility?: number;
   };
   /* Back-office turnaround per stage. Timing only — never invoice amounts. */
   turnaround?: Record<string, {
@@ -115,7 +131,9 @@ export interface ReportResponse {
     invoices_uploaded: { count: number; prev: number };
     coas_uploaded: { count: number; prev: number };
     approvals_done?: { count: number; prev: number };
-    lab_results?: { cur: { needed: number; back: number }; prev: { needed: number; back: number } };
+    // needed/back count only samples old enough to be due; taken and
+    // not_due_yet carry the rest so the card can say what it left out.
+    lab_results?: { cur: LabResultCount; prev: LabResultCount };
     invoice_completion?: {
       cur: { needed: number; done: number; todo?: { client: string; date: string | null; age: number | null }[] };
       prev: { needed: number; done: number; todo?: { client: string; date: string | null; age: number | null }[] };
@@ -155,6 +173,7 @@ export interface ReportResponse {
   roster?: string[];
   monthly_financials?: MonthlyFinancials;
   monthly_financials_series?: MonthlyFinancials[];
+  weekly_financials_series?: WeeklyFinancials[];
   finance_efficiency?: FinanceEfficiency;
   travel: TravelRow[];
   error?: string;
@@ -512,21 +531,45 @@ export async function buildWeeklyReportPdf(data: ReportResponse, logo: string | 
      straight from the week's numbers; categories with no data are skipped. ══ */
   const winners: { label: string; name: string; value: string }[] = [];
   const topPerf = data.performance[0];
-  if (topPerf && topPerf.weekly_inspections > 0) winners.push({ label: "Most Inspections", name: topPerf.inspector_name, value: `${topPerf.weekly_inspections} inspections` });
-  // Fastest to approve = highest share of their own inspections already
-  // approved (approved ÷ total), so someone who cleared their whole queue wins
-  // over someone who merely approved a big raw count. Volume breaks ties.
-  const topAppr = [...data.approvals]
-    .filter(a => a.total_records > 0 && a.approved > 0)
-    .sort((a, b) =>
-      (b.approved / b.total_records) - (a.approved / a.total_records)
-      || b.approved - a.approved)[0];
-  if (topAppr) {
-    const pct = Math.round(topAppr.approved * 100 / topAppr.total_records);
-    winners.push({ label: "Fastest to Approve", name: topAppr.inspector_name, value: `${pct}% approved (${topAppr.approved} of ${topAppr.total_records})` });
+  if (topPerf && topPerf.weekly_inspections > 0) {
+    // Where the work happened, as well as how much of it there was: the same
+    // count across one depot and across nine shops is not the same week.
+    const tv = data.travel.find(t => t.inspector_name === topPerf.inspector_name);
+    const fac = tv?.facilities ?? 0;
+    winners.push({
+      label: "Did the most inspections",
+      name: topPerf.inspector_name,
+      value: fac
+        ? `${topPerf.weekly_inspections} inspections at ${fac} ${fac === 1 ? "facility" : "facilities"}`
+        : `${topPerf.weekly_inspections} inspections`,
+    });
+  }
+  // Captured on time: the paperwork done while the visit is still fresh,
+  // which is the inspector's own work. A handful of records is not a week,
+  // so at least ten are needed; volume breaks a tie on the percentage.
+  const CAPTURE_MIN = 10;
+  const topCap = [...data.approvals]
+    .filter(a => a.total_records >= CAPTURE_MIN)
+    .sort((a, b) => b.capture_rate - a.capture_rate
+      || b.total_records - a.total_records)[0];
+  if (topCap && topCap.capture_rate > 0) {
+    winners.push({
+      label: "Captured their work on time",
+      name: topCap.inspector_name,
+      value: topCap.capture_rate === 100
+        ? `All ${topCap.total_records} within ${data.admin_lag_days} days`
+        : `${topCap.captured_on_time} of ${topCap.total_records} within ${data.admin_lag_days} days`,
+    });
   }
   const topComp = [...data.compliance].filter(c => c.compliant + c.non_compliant > 0).sort((a, b) => (b.rate ?? 0) - (a.rate ?? 0) || (b.inspections ?? 0) - (a.inspections ?? 0))[0];
-  if (topComp) winners.push({ label: "Best Compliance", name: topComp.inspector_name, value: `${topComp.rate}% of ${topComp.compliant + topComp.non_compliant} assessed` });
+  if (topComp) {
+    const judged = topComp.compliant + topComp.non_compliant;
+    winners.push({
+      label: "Best pass rate",
+      name: topComp.inspector_name,
+      value: `${topComp.compliant} of ${judged} inspections passed`,
+    });
+  }
   if (winners.length > 0) {
     doc.setFont("helvetica", "bold");
     doc.setFontSize(16);
@@ -630,7 +673,7 @@ export async function buildWeeklyReportPdf(data: ReportResponse, logo: string | 
       .map(c => `${c.inspector_name} (${c.not_assessed})`).join(", ");
     actions.push({
       sev: "red",
-      text: `Get outcomes recorded: ${noOutcome} of last week's inspections have no compliant / non-compliant outcome recorded, so nobody knows whether those clients are safe. Most outcomes missing: ${worstNo}. An inspection without an outcome cannot count as compliant.`,
+      text: `Get the missing results captured: ${noOutcome} inspections this ${data.is_single_week ? "week" : "period"} have no pass or fail saved, so we cannot say whether those products were safe. Mostly from: ${worstNo}. They are left out of the overall compliance figure, so the real figure may be better or worse than it looks. Ask these inspectors to capture the outcome.`,
     });
   }
   if (data.sample_status.overdue > 0) {
@@ -775,13 +818,13 @@ export async function buildWeeklyReportPdf(data: ReportResponse, logo: string | 
     y += 3;
     autoTable(doc, {
       startY: y + 1,
-      head: [["Inspector", "Inspections", "KM Travelled", "Hours on the Road"]],
-      body: effRows.map(t => [t.inspector_name, t.inspections, t.km.toLocaleString("en-ZA"), t.hours]),
+      head: [["Inspector", "Facilities Visited", "Inspections", "KM Travelled", "Hours on the Road"]],
+      body: effRows.map(t => [t.inspector_name, t.facilities ?? 0, t.inspections, t.km.toLocaleString("en-ZA"), t.hours]),
       margin: { left: ML, right: MR },
       styles: { fontSize: 7.5, cellPadding: 2.2, textColor: DARK },
       headStyles: { fillColor: TEAL, textColor: [255, 255, 255], fontSize: 7.5, fontStyle: "bold" },
       alternateRowStyles: { fillColor: [248, 250, 252] },
-      columnStyles: { 1: { halign: "center" }, 2: { halign: "center" }, 3: { halign: "center" } },
+      columnStyles: { 1: { halign: "center" }, 2: { halign: "center" }, 3: { halign: "center" }, 4: { halign: "center" } },
       didParseCell: (h: any) => {
         if (h.section === "head" && h.column.index > 0) h.cell.styles.halign = "center";
         if (h.section !== "body") return;
@@ -924,8 +967,13 @@ export async function buildWeeklyReportPdf(data: ReportResponse, logo: string | 
   autoTable(doc, {
     startY: y + 1,
     head: [["Rank", "Inspector", "Inspections", "Compliant", "Non-Compliant", "No Outcome Recorded", "% Compliant"]],
-    body: data.compliance.map(c => [c.rank, c.inspector_name, c.inspections ?? (c.compliant + c.non_compliant), c.compliant, c.non_compliant, c.not_assessed ?? 0, c.rate === null ? "n/a" : `${c.rate}%`]),
-    foot: [["", "Whole team — grand total", compTotals.insp, compTotals.c, compTotals.nc, compTotals.na, compTotalRate === null ? "n/a" : `${compTotalRate}%`]],
+    body: data.compliance.map(c => {
+      const judged = c.compliant + c.non_compliant;
+      return [c.rank, c.inspector_name, c.inspections ?? judged, c.compliant,
+        c.non_compliant, c.not_assessed ?? 0,
+        c.rate === null ? "no results yet" : `${c.rate}% of ${judged}`];
+    }),
+    foot: [["", "Whole team — grand total", compTotals.insp, compTotals.c, compTotals.nc, compTotals.na, compTotalRate === null ? "no results yet" : `${compTotalRate}% of ${compTotals.c + compTotals.nc}`]],
     margin: { left: ML, right: MR },
     styles: { fontSize: 7.5, cellPadding: 2.2, textColor: DARK },
     headStyles: { fillColor: TEAL, textColor: [255, 255, 255], fontSize: 7.5, fontStyle: "bold" },
@@ -1022,16 +1070,22 @@ export async function buildWeeklyReportPdf(data: ReportResponse, logo: string | 
   header("5. Travel Activity");
   autoTable(doc, {
     startY: y + 1,
-    head: [["Rank", "Inspector", "KM Travelled", "Hours on the Road", "Inspections", "KM per Inspection (Rough Estimate)"]],
-    body: data.travel.map(v => [v.rank, v.inspector_name, v.km.toLocaleString("en-ZA"), v.hours, v.inspections, v.avg_km_per_inspection]),
-    foot: [["", "Whole team — grand total", data.totals.total_km.toLocaleString("en-ZA"), data.totals.total_hours, data.travel.reduce((s, v) => s + v.inspections, 0), ""]],
+    head: [["Rank", "Inspector", "Facilities Visited", "KM Travelled", "Hours on the Road", "Inspections", "Average KM per Facility"]],
+    body: data.travel.map(v => [v.rank, v.inspector_name, v.facilities ?? 0, v.km.toLocaleString("en-ZA"), v.hours, v.inspections, v.km_per_facility ?? 0]),
+    // The facilities figure is counted distinctly across the team, not summed
+    // from the rows above: a shop two inspectors called on is one premises.
+    // The average underneath it is the week's kilometres over that figure.
+    foot: [
+      ["", "Whole team — grand total", data.totals.total_facilities ?? "", data.totals.total_km.toLocaleString("en-ZA"), data.totals.total_hours, data.travel.reduce((s, v) => s + v.inspections, 0), data.totals.avg_km_per_facility ?? ""],
+      ["", "Team average per facility", "", `${data.totals.avg_km_per_facility ?? 0} km`, `${data.totals.avg_hours_per_facility ?? 0} hrs`, "", ""],
+    ],
     rowPageBreak: "avoid",
     margin: { left: ML, right: MR },
     styles: { fontSize: 7.5, cellPadding: 2.2, textColor: DARK },
     headStyles: { fillColor: TEAL, textColor: [255, 255, 255], fontSize: 7.5, fontStyle: "bold" },
     footStyles: { fillColor: DARK, textColor: [255, 255, 255], fontSize: 7.5, fontStyle: "bold" },
     alternateRowStyles: { fillColor: [248, 250, 252] },
-    columnStyles: { 0: { halign: "center" }, 2: { halign: "center" }, 3: { halign: "center" }, 4: { halign: "center" }, 5: { halign: "center" } },
+    columnStyles: { 0: { halign: "center" }, 2: { halign: "center" }, 3: { halign: "center" }, 4: { halign: "center" }, 5: { halign: "center" }, 6: { halign: "center" } },
     didParseCell: (h: any) => {
       if (h.section !== "body") {
         if (h.column.index !== 1) h.cell.styles.halign = "center";
@@ -1484,7 +1538,8 @@ export async function buildManagerReportPdf(data: ReportResponse, logo: string |
     "4. Sample Pipeline",
     "5. Office & Admin",
     "6. Month by Month",
-    "7. Profit by Month",
+    "7. Profit by Week",
+    "8. Profit by Month",
   ].forEach((s, i) => doc.text(s, W / 2, logoBottom + 66 + i * 7, { align: "center" }));
   doc.setFontSize(8);
   doc.text("CONFIDENTIAL — For authorized personnel only", W / 2, H - 42, { align: "center" });
@@ -1715,7 +1770,7 @@ export async function buildManagerReportPdf(data: ReportResponse, logo: string |
       { key: "invoice" as const, name: "Invoice", who: "Finance" },
       { key: "sample_to_coa" as const, name: "Sample to COA", who: "Lab" },
     ];
-    const gT = 5, cwT = (CW - 3 * gT) / 4, chT = 30;
+    const gT = 5, cwT = (CW - 3 * gT) / 4, chT = 32.5;
     tstages.forEach((s, i) => {
       const t = feM.timeliness[s.key];
       const x = ML + i * (cwT + gT);
@@ -1731,16 +1786,51 @@ export async function buildManagerReportPdf(data: ReportResponse, logo: string |
       doc.setFont("helvetica", "bold"); doc.setFontSize(17); doc.setTextColor(...col);
       doc.text(med != null ? String(med) : "—", x + cwT / 2, y + 19.5, { align: "center" });
       doc.setFont("helvetica", "normal"); doc.setFontSize(6); doc.setTextColor(...GRAY);
-      doc.text("days (typical)", x + cwT / 2, y + 23, { align: "center" });
-      const trend = (t.prev_avg != null && t.avg != null) ? (t.avg < t.prev_avg ? "improving" : t.avg > t.prev_avg ? "slower" : "flat") : "";
-      const trendCol: [number, number, number] = trend === "improving" ? GREEN : trend === "slower" ? RED : GRAY;
+      doc.text("days for half of them", x + cwT / 2, y + 23, { align: "center" });
+      // Momentum. The median decides when it moves, because comparing
+      // averages once flagged invoice turnaround "slower" in a week its
+      // typical time improved from 5 days to 4, on one old invoice moving
+      // the mean by a tenth of a day (Armand, 2026-10-26). But a median in
+      // whole days usually does not move at all: documents-sent held a
+      // median of 8 while its average fell from 37.8 days to 9.8, and the
+      // card called that "flat". So when the median ties, the average
+      // breaks it, and the card says what actually changed.
+      const curMed = t.median ?? t.avg;
+      const prevMed = t.prev_median ?? t.prev_avg;
+      const medMoved = (curMed != null && prevMed != null) && curMed !== prevMed;
+      const avgMoved = (t.avg != null && t.prev_avg != null) && t.avg !== t.prev_avg;
+      // The percentage is taken off whichever pair decided the direction,
+      // so the words and the figure can never disagree. A previous value of
+      // zero has no percentage to give - nothing can be a share of nothing -
+      // so those fall back to stating the move in days.
+      const pctFaster = (now: number, before: number) =>
+        before > 0 ? Math.round(Math.abs(before - now) * 100 / before) : null;
+      let trend = "", moveNote = "";
+      if (medMoved) {
+        const pct = pctFaster(curMed!, prevMed!);
+        const dir = curMed! < prevMed! ? "faster" : "slower";
+        trend = pct != null ? `${pct}% ${dir} than last week`
+                            : `${dir} than last week`;
+        moveNote = `typical ${prevMed}d to ${curMed}d`;
+      } else if (avgMoved) {
+        const pct = pctFaster(t.avg!, t.prev_avg!);
+        const dir = t.avg! < t.prev_avg! ? "faster" : "slower";
+        trend = pct != null ? `${pct}% ${dir} than last week`
+                            : `${dir} than last week`;
+        moveNote = `avg ${t.prev_avg}d to ${t.avg}d`;
+      } else if (curMed != null) {
+        trend = "same as last week";
+      }
+      const trendCol: [number, number, number] =
+        trend.includes("faster") ? GREEN : trend.includes("slower") ? RED : GRAY;
       doc.setFontSize(5.8); doc.setTextColor(...GRAY);
-      doc.text(`avg ${t.avg != null ? t.avg : "—"}d${t.target != null ? ` · target ${t.target}d` : ""}`, x + cwT / 2, y + 26.6, { align: "center" });
-      if (trend) { doc.setFont("helvetica", "bold"); doc.setFontSize(6); doc.setTextColor(...trendCol); doc.text(trend, x + cwT / 2, y + 29.2, { align: "center" }); }
+      doc.text(`avg ${t.avg != null ? t.avg : "—"}d${t.target != null ? ` · target ${t.target}d` : ""}`, x + cwT / 2, y + 25.8, { align: "center" });
+      if (trend) { doc.setFont("helvetica", "bold"); doc.setFontSize(5.8); doc.setTextColor(...trendCol); doc.text(trend, x + cwT / 2, y + 28.3, { align: "center" }); }
+      if (moveNote) { doc.setFont("helvetica", "normal"); doc.setFontSize(5.2); doc.setTextColor(...GRAY); doc.text(moveNote, x + cwT / 2, y + 30.6, { align: "center" }); }
     });
     y += chT + 4;
     doc.setFont("helvetica", "italic"); doc.setFontSize(6.8); doc.setTextColor(...GRAY);
-    doc.text('Typical = median days from inspection to that step, for jobs that cleared it this week. Green = at or under target, amber = close, red = over. Trend is vs last week.', ML, y, { maxWidth: CW });
+    doc.text('The big number is the middle one: half the jobs cleared that step within it, half took longer. The average underneath is pulled up by a few old jobs, which is why the two differ. Green = at or under target, amber = within three days of it, red = over.', ML, y, { maxWidth: CW });
     doc.setFont("helvetica", "normal"); doc.setTextColor(...DARK); y += 8;
   }
 
@@ -2016,12 +2106,12 @@ export async function buildManagerReportPdf(data: ReportResponse, logo: string |
   if (tpA) {
     if (y > 210) { doc.addPage(); y = 16; } else if (y > 20) { y += 4; }
     header("5. Office & Admin");
-    intro('What the back office got through — this week next to the week before. "Documents sent" and "Invoices added" are files handled this week. "Lab results back" shows, of the samples TAKEN that week (each one needs a result), how many are back — so the target changes with sample volume (some weeks only 10 are needed, some 50). "Jobs waiting for lab results" below is a live count of every job (site visit) with a sample still at the lab and no result back yet — the whole backlog to date, not just this week.');
+    intro('What the back office got through, this week next to the week before. Documents and invoices are counted per VISIT, not per product, so one invoice covering six products counts once. Lab results count only the samples that have had their 5 days to come back; anything sampled more recently is not judged yet, because a sample taken on Friday cannot be late by Monday. "Jobs waiting for lab results" below is a live count of every visit with a sample still at the lab and no result back — the whole backlog to date, not just this week.');
     const nzA = (v: unknown) => Number(v) || 0;
     const moreFewerA = (n: number) => n === 0 ? "no change" : n > 0 ? `${n} more` : `${Math.abs(n)} fewer`;
     // Lab results: "X of Y (%)" — of the samples TAKEN that week, how many are back.
     const lr = tpA.lab_results;
-    const lrCell = (p?: { needed: number; back: number }) =>
+    const lrCell = (p?: LabResultCount) =>
       p && p.needed > 0 ? `${p.back} of ${p.needed} (${Math.round(p.back * 100 / p.needed)}%)`
         : p && p.needed === 0 ? "no samples" : "-";
     const lrChange = (() => {
@@ -2035,9 +2125,9 @@ export async function buildManagerReportPdf(data: ReportResponse, logo: string |
       startY: y,
       head: [["What the office did", "This week", "Week before", "Change"]],
       body: [
-        ["Documents sent to clients", String(nzA(tpA.sent.count)), String(nzA(tpA.sent.prev)), moreFewerA(nzA(tpA.sent.count) - nzA(tpA.sent.prev))],
-        ["Invoices added", String(nzA(tpA.invoices_uploaded.count)), String(nzA(tpA.invoices_uploaded.prev)), moreFewerA(nzA(tpA.invoices_uploaded.count) - nzA(tpA.invoices_uploaded.prev))],
-        ["Lab results back (of samples taken)", lrCell(lr?.cur), lrCell(lr?.prev), lrChange],
+        ["Documents sent to clients (per visit)", String(nzA(tpA.sent.count)), String(nzA(tpA.sent.prev)), moreFewerA(nzA(tpA.sent.count) - nzA(tpA.sent.prev))],
+        ["Invoices raised (per visit)", String(nzA(tpA.invoices_uploaded.count)), String(nzA(tpA.invoices_uploaded.prev)), moreFewerA(nzA(tpA.invoices_uploaded.count) - nzA(tpA.invoices_uploaded.prev))],
+        [`Lab results back (of those due after ${lr?.cur?.allowed_days ?? 5} days)`, lrCell(lr?.cur), lrCell(lr?.prev), lrChange],
       ],
       theme: "grid",
       styles: { fontSize: 8.5, cellPadding: 3, valign: "middle", lineColor: [226, 232, 240], textColor: DARK },
@@ -2178,6 +2268,103 @@ export async function buildManagerReportPdf(data: ReportResponse, logo: string |
     y = (doc as any).lastAutoTable.finalY + 10;
   }
 
+  /* ══ PROFIT BY WEEK (management-only) — the same grid as the month one
+     but a week at a time, plus how each inspector moved against the week
+     before. A month in progress always reads as a heavy loss (a full
+     month's salary against a part-month of revenue); a completed week does
+     not, so this is the honest short-term picture. ══ */
+  const wkSeriesRaw = (data.weekly_financials_series ?? []).filter(w => w.rows);
+  if (wkSeriesRaw.length) {
+    if (y > 150) { doc.addPage(); y = 16; } else if (y > 20) { y += 4; }
+    header("7. Profit by Week");
+    intro('The same sum as the month table below, taken one completed week at a time. Profit = what the inspector billed that week (hours, kilometres, samples) minus one week of their cost (a week of salary plus the 20% management fee). GREEN is profit, RED is a loss. CHANGE is last week against the week before it: green means they improved. Unlike the month table there is no part-month distortion here, so these are the figures to judge a week on.');
+
+    const weeks = [...wkSeriesRaw].reverse();            // oldest -> newest
+    const randKw = (n: number) => {
+      const neg = n < 0; const a = Math.abs(n);
+      const body = a >= 1000 ? `R${Math.round(a / 1000)}k` : `R${Math.round(a)}`;
+      return `${neg ? "-" : ""}${body}`;
+    };
+
+    const wNames = new Set<string>();
+    weeks.forEach(w => w.rows.forEach(r => wNames.add(r.inspector_name)));
+    const wProfit: Record<string, Record<number, number | undefined>> = {};
+    weeks.forEach((w, wi) => w.rows.forEach(r => {
+      (wProfit[r.inspector_name] ??= {})[wi] = r.profit;
+    }));
+
+    const lastIdx = weeks.length - 1, prevIdx = weeks.length - 2;
+    // Movement into the most recent week. Undefined where either week has
+    // nothing for them — a change against a week they did not work is not
+    // a change, it is a different situation.
+    const moveOf = (n: string) => {
+      const a = wProfit[n]?.[lastIdx], b = wProfit[n]?.[prevIdx];
+      return (a === undefined || b === undefined) ? undefined : a - b;
+    };
+    const wSorted = [...wNames].sort((a, b) =>
+      (wProfit[b]?.[lastIdx] ?? -Infinity) - (wProfit[a]?.[lastIdx] ?? -Infinity)
+      || a.localeCompare(b));
+
+    const NO_WORK_W = "no work this week";
+    const wHead = ["Inspector", ...weeks.map(w => w.label), "Change"];
+    const wBody = wSorted.map(n => [
+      n,
+      ...weeks.map((_, wi) => {
+        const p = wProfit[n]?.[wi];
+        return p === undefined ? NO_WORK_W : randKw(p);
+      }),
+      (() => { const m = moveOf(n); return m === undefined ? "-" : `${m >= 0 ? "+" : ""}${randKw(m)}`; })(),
+    ]);
+    const wTeamMove = weeks.length > 1
+      ? weeks[lastIdx].total_profit - weeks[prevIdx].total_profit : undefined;
+    const wFoot = ["Whole team", ...weeks.map(w => randKw(w.total_profit)),
+      wTeamMove === undefined ? "-" : `${wTeamMove >= 0 ? "+" : ""}${randKw(wTeamMove)}`];
+
+    const wColW = (CW - 44) / (weeks.length + 1);
+    autoTable(doc, {
+      startY: y,
+      head: [wHead],
+      body: wBody,
+      foot: [wFoot],
+      theme: "grid",
+      rowPageBreak: "avoid",
+      styles: { fontSize: 7.5, cellPadding: 2.1, valign: "middle", halign: "right", lineColor: [226, 232, 240], textColor: DARK },
+      headStyles: { fillColor: TEAL, textColor: WHITE, fontStyle: "bold", fontSize: 7.5, halign: "right", valign: "middle" },
+      footStyles: { fillColor: DARK, textColor: WHITE, fontStyle: "bold", fontSize: 7.5, halign: "right" },
+      alternateRowStyles: { fillColor: [248, 250, 252] },
+      columnStyles: (() => {
+        const cs: Record<number, any> = { 0: { cellWidth: 44, halign: "left", fontStyle: "bold" } };
+        for (let i = 1; i <= weeks.length + 1; i++) cs[i] = { cellWidth: wColW };
+        return cs;
+      })(),
+      margin: { left: ML, right: MR },
+      didParseCell: (d: any) => {
+        if (d.section === "head" && d.column.index > 0) d.cell.styles.halign = "center";
+        if (d.section !== "body" || d.column.index === 0) return;
+        const name = wSorted[d.row.index];
+        if (d.column.index === weeks.length + 1) {         // the Change column
+          const m = moveOf(name);
+          if (m === undefined) { d.cell.styles.textColor = GRAY; }
+          else { d.cell.styles.textColor = m >= 0 ? GREEN : RED; d.cell.styles.fontStyle = "bold"; }
+          return;
+        }
+        const p = wProfit[name]?.[d.column.index - 1];
+        if (p === undefined) {
+          d.cell.styles.textColor = GRAY;
+          d.cell.styles.fontStyle = "italic";
+          d.cell.styles.fontSize = 5.6;
+          d.cell.styles.halign = "center";
+        } else {
+          d.cell.styles.textColor = p >= 0 ? GREEN : RED;
+        }
+      },
+    });
+    y = (doc as any).lastAutoTable.finalY + 4;
+    doc.setFont("helvetica", "italic"); doc.setFontSize(6.8); doc.setTextColor(...GRAY);
+    doc.text('Amounts in thousands of rand. A week of cost is a twelfth of the year\'s salary over fifty-two weeks, so a full week of revenue is set against a full week of cost.', ML, y, { maxWidth: CW });
+    doc.setFont("helvetica", "normal"); doc.setTextColor(...DARK); y += 8;
+  }
+
   /* ══ 5. PROFIT BY MONTH (management-only) — one grid: inspectors down the
      side, months across the top, each cell that inspector's profit for the
      month (green = profit, red = loss). Profit = revenue (billed hrs/km/samples)
@@ -2185,7 +2372,7 @@ export async function buildManagerReportPdf(data: ReportResponse, logo: string |
   const finSeriesRaw = (data.monthly_financials_series ?? []).filter(m => m.rows);
   if (finSeriesRaw.length) {
     if (y > 150) { doc.addPage(); y = 16; } else if (y > 20) { y += 4; }
-    header("7. Profit by Month");
+    header("8. Profit by Month");
     intro('Each inspector\'s profit for every month, so you can see who is consistently making money for us. Profit = revenue billed (hours, kilometres, samples) minus their full cost for the month (salary and related deductions, plus a 20% management fee). A GREEN figure is real profit the inspector made for the business; a RED figure is a loss. The current month (marked with *) is negative simply because we are still early in it — a whole month\'s salary is already charged, but only a part-month of revenue has come in — so it corrects itself as the month fills up.');
 
     // Oldest → newest across the page (series comes newest-first)

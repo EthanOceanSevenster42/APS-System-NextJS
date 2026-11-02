@@ -306,6 +306,8 @@ class FoodSafetyAgencyInspectionForm(forms.ModelForm):
         ('lab_e', 'SMT'),
         ('lab_f', 'ARC'),
         ('lab_a', 'Food Safety Laboratory'),
+        ('lab_g', 'Food Consulting Services (FCS)'),
+        ('lab_h', 'AssureCloud/NOSA'),
     ]
 
     PRODUCT_CLASS_CHOICES = [
